@@ -1,0 +1,21 @@
+{
+  "name": "subby",
+  "module": "index.tsx",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@opentui/core": "^0.5.3",
+    "@opentui/react": "^0.5.3",
+    "@types/react": "^19.2.18",
+    "react": "^19.2.8"
+  },
+  "scripts": {
+    "start": "bun run index.tsx"
+  }
+}
