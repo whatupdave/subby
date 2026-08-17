@@ -60,6 +60,9 @@ function SubCard({ sub, usage, selected, onClick }: { sub: Sub; usage?: Usage; s
         <>
           <UsageRow name="session" win={usage.session} />
           <UsageRow name="weekly " win={usage.weekly} />
+          {usage.scoped?.map(({ name, win }) => (
+            <UsageRow key={name} name={name.padEnd(7)} win={win} />
+          ))}
         </>
       ) : (
         <text fg={DIM}>  loading…</text>

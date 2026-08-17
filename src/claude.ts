@@ -83,7 +83,12 @@ export async function fetchUsage(sub: Sub): Promise<Usage> {
   })
   if (!res.ok) return { error: `usage fetch failed: ${res.status}` }
   const j = (await res.json()) as any
-  const win = (w: any) =>
-    w ? { pct: w.utilization ?? 0, resetsAt: w.resets_at ? Date.parse(w.resets_at) : null } : undefined
-  return { session: win(j.five_hour), weekly: win(j.seven_day) }
+  const usage: Usage = { scoped: [] }
+  for (const l of j.limits ?? []) {
+    const win = { pct: l.percent ?? 0, resetsAt: l.resets_at ? Date.parse(l.resets_at) : null }
+    if (l.kind === "session") usage.session = win
+    else if (l.kind === "weekly_all") usage.weekly = win
+    else usage.scoped!.push({ name: (l.scope?.model?.display_name ?? l.kind).toLowerCase(), win })
+  }
+  return usage
 }
