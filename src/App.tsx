@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react"
-import { useKeyboard, useRenderer } from "@opentui/react"
+import { useBlur, useFocus, useKeyboard, useRenderer } from "@opentui/react"
 import { loadSubs, saveSubs } from "./store.ts"
 import * as claude from "./claude.ts"
 import * as codex from "./codex.ts"
@@ -81,6 +81,14 @@ export function App() {
   const [sel, setSel] = useState(0)
   const [status, setStatus] = useState("")
   const cancelLogin = useRef<(() => void) | null>(null)
+  const focused = useRef(true)
+
+  useBlur(() => {
+    focused.current = false
+  })
+  useFocus(() => {
+    focused.current = true
+  })
 
   async function poll(list: Sub[]) {
     const entries = await Promise.all(
@@ -92,7 +100,9 @@ export function App() {
 
   useEffect(() => {
     poll(subs)
-    const t = setInterval(() => poll(subs), 60_000)
+    const t = setInterval(() => {
+      if (focused.current) poll(subs)
+    }, 60_000)
     return () => clearInterval(t)
   }, [subs])
 
