@@ -23,4 +23,5 @@ export interface Usage {
   scoped?: { name: string; win: UsageWindow }[] // per-model limits, e.g. Fable weekly
   plan?: string
   error?: string
+  stale?: boolean // last fetch failed; showing previous numbers
 }

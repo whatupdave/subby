@@ -63,6 +63,7 @@ function SubCard({ sub, usage, selected, onClick }: { sub: Sub; usage?: Usage; s
           {usage.scoped?.map(({ name, win }) => (
             <UsageRow key={name} name={name.padEnd(7)} win={win} />
           ))}
+          {usage.stale && <text fg={DIM}>  refresh failed — showing last known</text>}
         </>
       ) : (
         <text fg={DIM}>  loading…</text>
@@ -94,7 +95,14 @@ export function App() {
     const entries = await Promise.all(
       list.map(async (s) => [s.id, await providers[s.provider].fetchUsage(s).catch((e) => ({ error: String(e?.message ?? e) }))] as const),
     )
-    setUsages(Object.fromEntries(entries))
+    setUsages((prev) =>
+      Object.fromEntries(
+        entries.map(([id, usage]) => {
+          const old = prev[id]
+          return [id, usage.error && old && !old.error ? { ...old, stale: true } : usage]
+        }),
+      ),
+    )
     saveSubs(list) // refresh() rotates tokens in place
   }
 
