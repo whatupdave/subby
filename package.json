@@ -16,6 +16,8 @@
     "react": "^19.2.8"
   },
   "scripts": {
-    "start": "bun run index.tsx"
+    "start": "bun run index.tsx",
+    "test": "bun test",
+    "typecheck": "bunx tsc --noEmit"
   }
 }
