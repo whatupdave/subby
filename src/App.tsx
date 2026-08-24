@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react"
 import { useBlur, useFocus, useKeyboard, useRenderer } from "@opentui/react"
-import { loadSubs, saveSubs } from "./store.ts"
+import { loadShowEmails, loadSubs, saveShowEmails, saveSubs } from "./store.ts"
 import * as claude from "./claude.ts"
 import * as codex from "./codex.ts"
+import * as proxy from "./proxy.ts"
 import type { Provider, Sub, Usage, UsageWindow } from "./types.ts"
 
 const providers = { claude, codex }
@@ -41,18 +42,20 @@ function UsageRow({ name, win }: { name: string; win?: UsageWindow }) {
   )
 }
 
-function SubCard({ sub, usage, selected, onClick }: { sub: Sub; usage?: Usage; selected: boolean; onClick: () => void }) {
+function SubCard({ sub, usage, selected, index, showEmails, onClick }: { sub: Sub; usage?: Usage; selected: boolean; index: number; showEmails: boolean; onClick: () => void }) {
+  const title = showEmails ? sub.label : `[${index}]`
+  const plan = showEmails ? usage?.plan : usage?.plan?.split(" · ")[0]
   return (
     <box
       border
       borderStyle="rounded"
-      title={` ${sub.label} `}
+      title={` ${title} `}
       onMouseDown={onClick}
       style={{ flexDirection: "column", borderColor: selected ? ACCENT : "#3a3a3a", paddingLeft: 1, paddingRight: 1, marginBottom: 0 }}
     >
       <text fg={PROVIDER_COLOR[sub.provider]}>
         {sub.provider}
-        {usage?.plan ? <span fg={DIM}> · {usage.plan}</span> : null}
+        {plan ? <span fg={DIM}> · {plan}</span> : null}
       </text>
       {usage?.error ? (
         <text fg="#ff5f5f">  {usage.error}</text>
@@ -77,12 +80,51 @@ type Mode = "list" | "pick" | "adding" | "confirm-remove"
 export function App() {
   const renderer = useRenderer()
   const [subs, setSubs] = useState<Sub[]>(loadSubs)
+  const [showEmails, setShowEmails] = useState(loadShowEmails)
   const [usages, setUsages] = useState<Record<string, Usage>>({})
   const [mode, setMode] = useState<Mode>("list")
   const [sel, setSel] = useState(0)
   const [status, setStatus] = useState("")
+  const [proxyInfo, setProxyInfo] = useState(proxy.info())
   const cancelLogin = useRef<(() => void) | null>(null)
   const focused = useRef(true)
+  const subsRef = useRef(subs)
+
+  useEffect(() => {
+    proxy.setSubSource(() => subsRef.current)
+    try {
+      proxy.startProxy()
+      setProxyInfo(proxy.info())
+    } catch (e: any) {
+      setStatus(`proxy failed: ${e?.message ?? e}`)
+    }
+    return () => {
+      proxy.setSubSource(null)
+      proxy.stopProxy()
+    }
+  }, [])
+  useEffect(() => {
+    subsRef.current = subs
+  }, [subs])
+  useEffect(() => {
+    const t = setInterval(() => setProxyInfo(proxy.info()), 1_000)
+    return () => clearInterval(t)
+  }, [])
+
+  function toggleProxy() {
+    try {
+      if (proxy.isRunning()) {
+        proxy.stopProxy()
+        setStatus("proxy stopped")
+      } else {
+        proxy.startProxy()
+        setStatus("proxy started")
+      }
+      setProxyInfo(proxy.info())
+    } catch (e: any) {
+      setStatus(`proxy failed: ${e?.message ?? e}`)
+    }
+  }
 
   useBlur(() => {
     focused.current = false
@@ -129,7 +171,7 @@ export function App() {
     setStatus(`waiting for ${provider} login in browser…`)
     promise
       .then((sub) => {
-        setStatus(`added ${sub.label}`)
+        setStatus("added")
         setSubs((prev) => {
           const next = [...prev, sub]
           saveSubs(next)
@@ -180,6 +222,16 @@ export function App() {
       case "d":
         if (subs.length) setMode("confirm-remove")
         break
+      case "p":
+        toggleProxy()
+        break
+      case "e":
+        setShowEmails((v) => {
+          const next = !v
+          saveShowEmails(next)
+          return next
+        })
+        break
       case "up":
       case "k":
         setSel((s) => Math.max(0, s - 1))
@@ -199,7 +251,7 @@ export function App() {
       </text>
       <scrollbox style={{ flexGrow: 1, marginTop: 1 }}>
         {subs.map((sub, i) => (
-          <SubCard key={sub.id} sub={sub} usage={usages[sub.id]} selected={i === sel && mode === "list"} onClick={() => setSel(i)} />
+          <SubCard key={sub.id} sub={sub} usage={usages[sub.id]} selected={i === sel && mode === "list"} index={i + 1} showEmails={showEmails} onClick={() => setSel(i)} />
         ))}
         {subs.length === 0 && <text fg={DIM}>no subs yet — press [a] or click the button below</text>}
         <box
@@ -228,11 +280,20 @@ export function App() {
 
       <text>
         {mode === "confirm-remove" ? (
-          <span fg="#ffaf5f">remove {subs[sel]?.label}? [y/n]</span>
+          <span fg="#ffaf5f">remove {showEmails ? subs[sel]?.label : `[${sel + 1}]`}? [y/n]</span>
         ) : mode === "adding" ? (
           <span fg="#ffaf5f">{status} (esc to cancel)</span>
         ) : (
-          <span fg={DIM}>[a] add · [r] refresh · [d] remove · [↑↓] select · [q] quit{status ? `  —  ${status}` : ""}</span>
+          <span fg={DIM}>
+            [a] add · [r] refresh · [d] remove · [p] proxy {proxyInfo.url ?? "off"}
+            {proxyInfo.running
+              ? ` → ${showEmails ? subs.find((s) => s.id === proxyInfo.currentId)?.label ?? "—" : proxyInfo.currentId ? `#${subs.findIndex((s) => s.id === proxyInfo.currentId) + 1 || "?"}` : "—"}`
+              : ""}
+            {" · [e] "}
+            {showEmails ? "hide" : "show"}
+            {" emails · [↑↓] select · [q] quit"}
+            {status ? `  —  ${status}` : ""}
+          </span>
         )}
       </text>
     </box>

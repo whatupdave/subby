@@ -1,0 +1,272 @@
+import { describe, test, expect, beforeAll, afterAll } from "bun:test"
+import * as proxy from "./src/proxy.ts"
+import type { Sub } from "./src/types.ts"
+
+const hits: string[] = []
+let lastAccept: string | null = null
+let lastBody: Record<string, unknown> | null = null
+let refreshHits = 0
+
+function freshAccessToken(): string {
+  const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3_600 })).toString("base64url")
+  return `header.${payload}.signature`
+}
+
+const upstream = Bun.serve({
+  port: 0,
+  async fetch(req) {
+    const url = new URL(req.url)
+    const acct = req.headers.get("chatgpt-account-id")
+    if (url.pathname === "/oauth/token") {
+      refreshHits++
+      const params = new URLSearchParams(await req.text())
+      if (params.get("refresh_token") === "transient-K") return new Response("unavailable", { status: 503 })
+      return Response.json({ access_token: freshAccessToken(), refresh_token: "rotated" })
+    }
+    if (url.pathname === "/wham/usage") {
+      if (acct === "D") return new Response("usage unavailable", { status: 503 })
+      if (acct === "H") {
+        await Bun.sleep(1_000)
+        return Response.json({ plan_type: "plus", rate_limit: { primary_window: { used_percent: 0 } } })
+      }
+      const used = acct === "A" || acct === "E" ? 100 : acct === "B" ? 40 : acct === "C" || acct === "G" || acct === "I" ? 10 : 0
+      return Response.json({
+        plan_type: "plus",
+        rate_limit: { primary_window: { used_percent: used, limit_window_seconds: 5 * 3600, reset_at: Math.ceil(Date.now() / 1000) + 3600 } },
+      })
+    }
+    if (url.pathname === "/codex/responses") {
+      hits.push(acct!)
+      lastAccept = req.headers.get("accept")
+      const body = (await req.json()) as Record<string, unknown>
+      lastBody = body
+      if (acct === "A") return Response.json({ error: { message: "Monthly usage limit reached (GoUsageLimitError)" } }, { status: 429 })
+      if (acct === "B" && body.fail) return Response.json({ error: { message: "Monthly usage limit reached" } }, { status: 429 })
+      if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
+        return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
+      }
+      const response = { id: "resp_1", account: acct, store: body.store, model: body.model }
+      if (body.stream) {
+        return new Response(`data: ${JSON.stringify(response)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+      }
+      return Response.json(response)
+    }
+    return new Response("not found", { status: 404 })
+  },
+})
+
+function makeSub(id: string): Sub {
+  return {
+    id,
+    provider: "codex",
+    label: `sub-${id}`,
+    tokens: { access: `tok-${id}`, refresh: "", expiresAt: Date.now() + 24 * 3600_000, accountId: id },
+  }
+}
+
+let base = ""
+
+beforeAll(() => {
+  process.env.SUBBY_CHATGPT_BASE = `http://127.0.0.1:${upstream.port}`
+  process.env.SUBBY_OPENAI_TOKEN_URL = `http://127.0.0.1:${upstream.port}/oauth/token`
+  proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+  proxy.setSubSaver(() => {})
+  proxy.startProxy(0)
+  base = `http://127.0.0.1:${proxy.info().port}`
+})
+
+afterAll(() => {
+  proxy.stopProxy()
+  proxy.setSubSaver(null)
+  delete process.env.SUBBY_CHATGPT_BASE
+  delete process.env.SUBBY_OPENAI_TOKEN_URL
+  upstream.stop(true)
+})
+
+async function json(res: Response): Promise<any> {
+  return res.json()
+}
+
+async function responses(body: Record<string, unknown>) {
+  return fetch(`${base}/v1/responses`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  })
+}
+
+describe("subby proxy", () => {
+  test("reports the OpenAI-compatible base URL", () => {
+    expect(proxy.info().url).toBe(`${base}/v1`)
+  })
+
+  test("/v1/models lists codex models", async () => {
+    const res = await fetch(`${base}/v1/models`)
+    const j = await json(res)
+    expect(res.status).toBe(200)
+    expect(j.object).toBe("list")
+    expect(j.data.map((m: any) => m.id)).toContain("gpt-5.4")
+  })
+
+  test("/v1/models/:model retrieves a model", async () => {
+    const res = await fetch(`${base}/v1/models/gpt-5.4`)
+    expect(res.status).toBe(200)
+    expect(await json(res)).toEqual({ id: "gpt-5.4", object: "model", created: 0, owned_by: "openai" })
+  })
+
+  test("retrieving an unknown model returns 404", async () => {
+    const res = await fetch(`${base}/v1/models/not-a-model`)
+    expect(res.status).toBe(404)
+    expect((await json(res)).error.message).toMatch(/not found/i)
+  })
+
+  test("rotates to most available sub on first request", async () => {
+    // A=100% used, B=40%, C=10% → C should win
+    const res = await responses({ model: "gpt-5.4", input: "hi" })
+    const j = await json(res)
+    expect(res.status).toBe(200)
+    expect(j.account).toBe("C")
+    expect(hits).toEqual(["C"])
+  })
+
+  test("stays sticky on the current sub", async () => {
+    for (let i = 0; i < 3; i++) {
+      const res = await responses({ model: "gpt-5.4", input: "again" })
+      expect((await json(res)).account).toBe("C")
+    }
+    expect(hits.every((h) => h === "C")).toBe(true)
+  })
+
+  test("forces store:false like the codex backend requires", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x", store: true })
+    const j = await json(res)
+    expect(j.store).toBe(false)
+  })
+
+  test("supports explicit non-streaming responses", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toContain("application/json")
+    expect(lastAccept).toBe("application/json")
+    expect(lastBody?.stream).toBe(false)
+  })
+
+  test("passes through streaming responses", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x", stream: true })
+    expect(res.status).toBe(200)
+    expect(res.headers.get("content-type")).toContain("text/event-stream")
+    expect(lastAccept).toBe("text/event-stream")
+    expect(await res.text()).toContain("data: [DONE]")
+  })
+
+  test("defaults to non-streaming when stream is omitted", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x" })
+    expect(res.status).toBe(200)
+    expect(lastAccept).toBe("application/json")
+    expect(lastBody).not.toHaveProperty("stream")
+  })
+
+  test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {
+    proxy.setSubSource(() => [makeSub("E"), makeSub("D")])
+    const res = await responses({ model: "gpt-5.4", input: "usage fallback" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).account).toBe("D")
+  })
+
+  test("does not let a hung usage request block a healthy account", async () => {
+    process.env.SUBBY_USAGE_TIMEOUT_MS = "20"
+    proxy.setSubSource(() => [makeSub("H"), makeSub("I")])
+    try {
+      const res = await responses({ model: "gpt-5.4", input: "usage timeout" })
+      expect(res.status).toBe(200)
+      expect((await json(res)).account).toBe("I")
+    } finally {
+      delete process.env.SUBBY_USAGE_TIMEOUT_MS
+    }
+  })
+
+  test("deduplicates concurrent refreshes after 401 responses", async () => {
+    const sub = makeSub("J")
+    sub.tokens.refresh = "refresh-J"
+    proxy.setSubSource(() => [sub])
+    refreshHits = 0
+
+    const results = await Promise.all([
+      responses({ model: "gpt-5.4", input: "concurrent one" }),
+      responses({ model: "gpt-5.4", input: "concurrent two" }),
+    ])
+    expect(results.map((res) => res.status)).toEqual([200, 200])
+    expect(refreshHits).toBe(1)
+  })
+
+  test("does not quarantine accounts after transient refresh failures", async () => {
+    const sub = makeSub("K")
+    proxy.setSubSource(() => [sub])
+    expect((await json(await responses({ model: "gpt-5.4", input: "establish sticky account" }))).account).toBe("K")
+
+    sub.tokens.refresh = "transient-K"
+    sub.tokens.expiresAt = 0
+    expect((await responses({ model: "gpt-5.4", input: "transient failure" })).status).toBe(502)
+
+    sub.tokens.refresh = ""
+    sub.tokens.expiresAt = Date.now() + 3_600_000
+    const recovered = await responses({ model: "gpt-5.4", input: "retry" })
+    expect(recovered.status).toBe(200)
+    expect((await json(recovered)).account).toBe("K")
+  })
+
+  test("fails over after persistent account authorization errors", async () => {
+    proxy.setSubSource(() => [makeSub("F"), makeSub("G")])
+    hits.length = 0
+    const res = await responses({ model: "gpt-5.4", input: "auth fallback" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).account).toBe("G")
+    expect(hits).toEqual(["F", "F", "G"])
+  })
+
+  test("fails over when the sticky sub is used up", async () => {
+    proxy.setSubSource(() => [makeSub("A"), makeSub("B")])
+    hits.length = 0
+    const res = await responses({ model: "gpt-5.4", input: "y" })
+    expect((await json(res)).account).toBe("B")
+    expect(hits).toEqual(["B"])
+    const res2 = await responses({ model: "gpt-5.4", input: "z", fail: true })
+    expect(res2.status).toBe(429)
+    const j2 = await json(res2)
+    expect(j2.error.message).toMatch(/used up/i)
+  })
+
+  test("rejects stateless conversation chaining", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x", previous_response_id: "resp_previous" })
+    expect(res.status).toBe(400)
+    expect((await json(res)).error.message).toMatch(/stateless/i)
+  })
+
+  test("rejects browser-safelisted content types", async () => {
+    const before = hits.length
+    const res = await fetch(`${base}/v1/responses`, { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" })
+    expect(res.status).toBe(415)
+    expect(hits).toHaveLength(before)
+  })
+
+  test("rejects invalid media types and non-object JSON", async () => {
+    const badMediaType = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json-whoops" },
+      body: "{}",
+    })
+    expect(badMediaType.status).toBe(415)
+
+    const nonObject = await fetch(`${base}/v1/responses`, {
+      method: "POST",
+      headers: { "content-type": "application/json; charset=utf-8" },
+      body: "null",
+    })
+    expect(nonObject.status).toBe(400)
+  })
+
+  test("unknown route 404s", async () => {
+    const res = await fetch(`${base}/v1/chat/completions`, { method: "POST", body: "{}" })
+    expect(res.status).toBe(404)
+  })
+})
