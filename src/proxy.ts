@@ -2,11 +2,17 @@ import { loadSubs, saveSubs } from "./store.ts"
 import { ensureFreshToken, fetchUsage, TokenRefreshError } from "./codex.ts"
 import type { Sub, Usage } from "./types.ts"
 
-const upstreamUrl = () => `${process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.com/backend-api"}/codex/responses`
+const upstreamBase = () => process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.com/backend-api"
+const responsesUrl = () => `${upstreamBase()}/codex/responses`
+const modelsUrl = () => {
+  const url = new URL(`${upstreamBase()}/codex/models`)
+  url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.147.0")
+  return url
+}
 const USAGE_CACHE_TTL_MS = 60_000
+const MODEL_CACHE_TTL_MS = 5 * 60_000
+const MODEL_REQUEST_TIMEOUT_MS = 5_000
 const usageTimeoutMs = () => Number(process.env.SUBBY_USAGE_TIMEOUT_MS) || 5_000
-
-const CODEX_MODELS = ["gpt-5.3-codex-spark", "gpt-5.4", "gpt-5.4-mini", "gpt-5.5"]
 
 // Terminal usage-limit errors (plan exhausted) vs transient 429 rate limits
 function isUsageLimitError(status: number, text: string): boolean {
@@ -165,7 +171,7 @@ async function pickSub(signal: AbortSignal): Promise<Sub> {
   return best.sub
 }
 
-async function forward(sub: Sub, body: string, stream: boolean, signal: AbortSignal, forceFresh = false) {
+async function withAccessToken(sub: Sub, forceFresh: boolean, request: (accessToken: string) => Promise<Response>) {
   const before = sub.tokens.access
   try {
     await ensureFreshToken(sub, forceFresh)
@@ -176,24 +182,66 @@ async function forward(sub: Sub, body: string, stream: boolean, signal: AbortSig
   saveRefreshedToken(sub, before)
 
   const accessToken = sub.tokens.access
-  const sessionId = crypto.randomUUID()
-  const response = await fetch(upstreamUrl(), {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${accessToken}`,
-      "chatgpt-account-id": sub.tokens.accountId ?? "",
-      "content-type": "application/json",
-      accept: stream ? "text/event-stream" : "application/json",
-      "openai-beta": "responses=experimental",
-      originator: "subby",
-      "user-agent": "subby",
-      "session-id": sessionId,
-      "x-client-request-id": sessionId,
-    },
-    body,
-    signal,
+  return { response: await request(accessToken), accessToken }
+}
+
+async function withAuthRetry(sub: Sub, request: (accessToken: string) => Promise<Response>): Promise<Response> {
+  const first = await withAccessToken(sub, false, request)
+  if (first.response.status !== 401) return first.response
+  await first.response.text()
+
+  const forceRefresh = sub.tokens.access === first.accessToken
+  const retry = await withAccessToken(sub, forceRefresh, request)
+  if (retry.response.status !== 401) return retry.response
+  await retry.response.text()
+  throw new AccountAuthError(`${sub.label} is unauthorized`, true)
+}
+
+function abortable<T>(start: () => Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(signal.reason)
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort)
+    const onAbort = () => {
+      cleanup()
+      reject(signal.reason)
+    }
+    signal.addEventListener("abort", onAbort, { once: true })
+    start().then(
+      (value) => {
+        cleanup()
+        resolve(value)
+      },
+      (error) => {
+        cleanup()
+        reject(error)
+      },
+    )
   })
-  return { response, accessToken }
+}
+
+function forward(sub: Sub, body: string, stream: boolean, signal: AbortSignal): Promise<Response> {
+  return abortable(
+    () => withAuthRetry(sub, (accessToken) => {
+      const sessionId = crypto.randomUUID()
+      return fetch(responsesUrl(), {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          "chatgpt-account-id": sub.tokens.accountId ?? "",
+          "content-type": "application/json",
+          accept: stream ? "text/event-stream" : "application/json",
+          "openai-beta": "responses=experimental",
+          originator: "subby",
+          "user-agent": "subby",
+          "session-id": sessionId,
+          "x-client-request-id": sessionId,
+        },
+        body,
+        signal,
+      })
+    }),
+    signal,
+  )
 }
 
 function passthrough(upstream: Response, body: string | ReadableStream<Uint8Array> | null = upstream.body): Response {
@@ -233,11 +281,8 @@ async function handleResponses(req: Request): Promise<Response> {
   for (let i = 0; i < attempts; i++) {
     const sub = await pickSub(req.signal)
     let res: Response
-    let rejectedAccessToken: string
     try {
-      const forwarded = await forward(sub, body, stream, req.signal)
-      res = forwarded.response
-      rejectedAccessToken = forwarded.accessToken
+      res = await forward(sub, body, stream, req.signal)
     } catch (e) {
       state.lastError = e instanceof Error ? e.message : String(e)
       if (e instanceof AccountAuthError) {
@@ -255,36 +300,7 @@ async function handleResponses(req: Request): Promise<Response> {
       return passthrough(res)
     }
 
-    let text = await res.text()
-
-    // access token died mid-flight — refresh hard and retry same sub once
-    if (res.status === 401) {
-      try {
-        const forceRefresh = sub.tokens.access === rejectedAccessToken
-        res = (await forward(sub, body, stream, req.signal, forceRefresh)).response
-      } catch (e) {
-        state.lastError = e instanceof Error ? e.message : String(e)
-        if (e instanceof AccountAuthError) {
-          if (!e.permanent) return errorResponse(502, `token refresh failed: ${state.lastError}`)
-          exhaust(sub, undefined)
-          terminalStatus = 503
-          continue
-        }
-        return errorResponse(502, `upstream request failed: ${state.lastError}`)
-      }
-      if (res.ok) {
-        state.requests++
-        state.lastError = null
-        return passthrough(res)
-      }
-      text = await res.text()
-      if (res.status === 401) {
-        exhaust(sub, undefined)
-        state.lastError = `${sub.label} is unauthorized`
-        terminalStatus = 503
-        continue
-      }
-    }
+    const text = await res.text()
 
     // sub is used up — mark exhausted and fail over to the next one
     if (isUsageLimitError(res.status, text)) {
@@ -308,15 +324,95 @@ function modelObject(id: string) {
   return { id, object: "model", created: 0, owned_by: "openai" }
 }
 
-function handleModels(): Response {
-  return Response.json({
-    object: "list",
-    data: CODEX_MODELS.map(modelObject),
-  })
+let modelCache: { at: number; ids: string[] } | null = null
+
+async function parseModelIds(res: Response): Promise<string[]> {
+  let value: unknown
+  try {
+    value = await res.json()
+  } catch {
+    throw new ApiError(502, "models upstream returned invalid JSON")
+  }
+  if (!value || typeof value !== "object" || !Array.isArray((value as { models?: unknown }).models)) {
+    throw new ApiError(502, "models upstream returned an invalid catalog")
+  }
+  const slugs = (value as { models: unknown[] }).models
+    .map((model) => model && typeof model === "object" ? (model as { slug?: unknown }).slug : undefined)
+    .filter((slug): slug is string => typeof slug === "string" && slug.length > 0)
+  return [...new Set(slugs)]
 }
 
-function handleModel(id: string): Response {
-  if (!CODEX_MODELS.includes(id)) return errorResponse(404, `model '${id}' not found`)
+async function modelIds(signal: AbortSignal): Promise<string[]> {
+  const cached = modelCache
+  if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.ids
+
+  const allSubs = getSubs().filter((sub) => sub.provider === "codex")
+  const current = allSubs.find((sub) => sub.id === state.currentId)
+  const subs = current ? [current, ...allSubs.filter((sub) => sub !== current)] : allSubs
+  if (!subs.length) {
+    if (cached) return cached.ids
+    throw new ApiError(503, "no codex subs configured in subby")
+  }
+
+  const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)])
+  let failure = new ApiError(502, "models request failed")
+  for (const sub of subs) {
+    let res: Response
+    try {
+      res = await abortable(
+        () => withAuthRetry(sub, (accessToken) =>
+          fetch(modelsUrl(), {
+            headers: {
+              authorization: `Bearer ${accessToken}`,
+              "chatgpt-account-id": sub.tokens.accountId ?? "",
+              originator: "subby",
+              "user-agent": "subby",
+            },
+            signal: requestSignal,
+          }),
+        ),
+        requestSignal,
+      )
+    } catch (e) {
+      if (e instanceof AccountAuthError) {
+        failure = new ApiError(e.permanent ? 503 : 502, `token refresh failed: ${e.message}`)
+        if (e.permanent) exhaust(sub, undefined)
+      } else {
+        failure = new ApiError(502, `models request failed: ${e instanceof Error ? e.message : String(e)}`)
+      }
+      continue
+    }
+    if (res.status === 403) {
+      await res.text()
+      exhaust(sub, undefined)
+      failure = new ApiError(503, `${sub.label} cannot access the models catalog`)
+      continue
+    }
+    if (!res.ok) {
+      await res.text()
+      failure = new ApiError(res.status, `models upstream returned ${res.status}`)
+      break
+    }
+
+    try {
+      const ids = await parseModelIds(res)
+      modelCache = { at: Date.now(), ids }
+      return ids
+    } catch (e) {
+      failure = e instanceof ApiError ? e : new ApiError(502, "models upstream returned an invalid catalog")
+      break
+    }
+  }
+  if (cached) return cached.ids
+  throw failure
+}
+
+async function handleModels(signal: AbortSignal): Promise<Response> {
+  return Response.json({ object: "list", data: (await modelIds(signal)).map(modelObject) })
+}
+
+async function handleModel(id: string, signal: AbortSignal): Promise<Response> {
+  if (!(await modelIds(signal)).includes(id)) return errorResponse(404, `model '${id}' not found`)
   return Response.json(modelObject(id))
 }
 
@@ -343,11 +439,11 @@ export function startProxy(port = Number(process.env.SUBBY_PORT) || 8787): void 
           return await handleResponses(req)
         }
         if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-          return handleModels()
+          return await handleModels(req.signal)
         }
         if (req.method === "GET") {
           const match = url.pathname.match(/^\/(?:v1\/)?models\/(.+)$/)
-          if (match) return handleModel(decodeURIComponent(match[1]!))
+          if (match) return await handleModel(decodeURIComponent(match[1]!), req.signal)
         }
         return errorResponse(404, `subby proxy: unknown route ${req.method} ${url.pathname}`)
       } catch (e) {

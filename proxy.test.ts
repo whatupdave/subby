@@ -6,6 +6,8 @@ const hits: string[] = []
 let lastAccept: string | null = null
 let lastBody: Record<string, unknown> | null = null
 let refreshHits = 0
+let modelHits = 0
+let modelClientVersion: string | null = null
 
 function freshAccessToken(): string {
   const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3_600 })).toString("base64url")
@@ -22,6 +24,12 @@ const upstream = Bun.serve({
       const params = new URLSearchParams(await req.text())
       if (params.get("refresh_token") === "transient-K") return new Response("unavailable", { status: 503 })
       return Response.json({ access_token: freshAccessToken(), refresh_token: "rotated" })
+    }
+    if (url.pathname === "/codex/models") {
+      modelHits++
+      modelClientVersion = url.searchParams.get("client_version")
+      if (acct === "A") return new Response("forbidden", { status: 403 })
+      return Response.json({ models: [{ slug: "gpt-5.6-sol" }, { slug: "gpt-dynamic" }] })
     }
     if (url.pathname === "/wham/usage") {
       if (acct === "D") return new Response("usage unavailable", { status: 503 })
@@ -100,24 +108,38 @@ describe("subby proxy", () => {
     expect(proxy.info().url).toBe(`${base}/v1`)
   })
 
-  test("/v1/models lists codex models", async () => {
+  test("/v1/models lists the upstream Codex catalog", async () => {
     const res = await fetch(`${base}/v1/models`)
     const j = await json(res)
     expect(res.status).toBe(200)
     expect(j.object).toBe("list")
-    expect(j.data.map((m: any) => m.id)).toContain("gpt-5.4")
+    expect(j.data.map((m: any) => m.id)).toEqual(["gpt-5.6-sol", "gpt-dynamic"])
+    expect(modelClientVersion).toBe("0.147.0")
   })
 
-  test("/v1/models/:model retrieves a model", async () => {
-    const res = await fetch(`${base}/v1/models/gpt-5.4`)
+  test("/v1/models/:model retrieves a model from the cached catalog", async () => {
+    const res = await fetch(`${base}/v1/models/gpt-dynamic`)
     expect(res.status).toBe(200)
-    expect(await json(res)).toEqual({ id: "gpt-5.4", object: "model", created: 0, owned_by: "openai" })
+    expect(await json(res)).toEqual({ id: "gpt-dynamic", object: "model", created: 0, owned_by: "openai" })
+    expect(modelHits).toBe(2)
   })
 
   test("retrieving an unknown model returns 404", async () => {
     const res = await fetch(`${base}/v1/models/not-a-model`)
     expect(res.status).toBe(404)
     expect((await json(res)).error.message).toMatch(/not found/i)
+  })
+
+  test("serves the cached catalog without an available subscription", async () => {
+    proxy.setSubSource(() => [])
+    try {
+      const res = await fetch(`${base}/v1/models`)
+      expect(res.status).toBe(200)
+      expect((await json(res)).data).toHaveLength(2)
+      expect(modelHits).toBe(2)
+    } finally {
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
   })
 
   test("rotates to most available sub on first request", async () => {

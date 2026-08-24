@@ -25,6 +25,8 @@ The proxy implements:
 - `GET /v1/models`
 - `GET /v1/models/:model`
 
+Model endpoints use a five-minute cache of the authenticated Codex model catalog, so newly available models do not require a subby release.
+
 Point an OpenAI Responses API client at it:
 
 ```bash
@@ -67,6 +69,7 @@ An exhausted subscription remains skipped until its relevant usage window resets
 | `SUBBY_HOST` | `127.0.0.1` | Proxy bind address |
 | `SUBBY_PORT` | `8787` | Proxy port |
 | `SUBBY_KEY` | unset | If set, require `Authorization: Bearer <value>` |
+| `SUBBY_CODEX_CLIENT_VERSION` | `0.147.0` | Codex compatibility version sent when fetching the model catalog |
 
 To protect the endpoint with a key:
 
