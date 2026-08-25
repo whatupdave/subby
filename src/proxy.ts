@@ -349,6 +349,7 @@ async function handleResponses(req: Request): Promise<Response> {
   // input items are likewise unsupported ("prompt_cache_breakpoint is not
   // supported on this model").
   delete parsed.prompt_cache_options
+  delete parsed.max_output_tokens
   if (Array.isArray(parsed.input)) {
     for (const item of parsed.input) {
       if (!item || typeof item !== "object") continue

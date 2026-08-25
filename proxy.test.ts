@@ -169,10 +169,11 @@ describe("subby proxy", () => {
   })
 
   test("strips prompt_cache_options some codex accounts reject", async () => {
-    const res = await responses({ model: "gpt-5.4", input: "x", prompt_cache_key: "k", prompt_cache_options: { ttl: "1h" } })
+    const res = await responses({ model: "gpt-5.4", input: "x", prompt_cache_key: "k", prompt_cache_options: { ttl: "1h" }, max_output_tokens: 64 })
     expect(res.status).toBe(200)
     expect(lastBody).not.toHaveProperty("prompt_cache_options")
     expect(lastBody?.prompt_cache_key).toBe("k")
+    expect(lastBody).not.toHaveProperty("max_output_tokens")
   })
 
   test("strips prompt_cache_breakpoint markers from input items", async () => {
