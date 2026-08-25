@@ -62,6 +62,7 @@ const upstream = Bun.serve({
         model: body.model,
         status,
         output: [],
+        previous_response_id: null,
         error: status === "failed" ? { code: "server_error", message: "generation failed" } : null,
         incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
       }
@@ -81,7 +82,15 @@ const upstream = Bun.serve({
         : outputItems.map(({ output_index, item }) => `data: ${JSON.stringify({ type: "response.output_item.done", output_index, item })}`)
       events.push(`data: ${JSON.stringify({ type: `response.${status}`, response })}`, "data: [DONE]")
       const separator = body.model === "test-cr-framing" ? "\r\r" : "\r\n\r\n"
-      return new Response(`${events.join(separator)}${separator}`, { headers: { "content-type": "text/event-stream" } })
+      const payload = `${events.join(separator)}${separator}`
+      if (body.model === "test-terminal-open") {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(payload))
+          },
+        }), { headers: { "content-type": "text/event-stream" } })
+      }
+      return new Response(payload, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response("not found", { status: 404 })
   },
@@ -206,6 +215,12 @@ describe("subby proxy", () => {
       expect(res.status).toBe(200)
       expect((await json(res)).status).toBe(status)
     }
+  })
+
+  test("returns after a terminal event without waiting for upstream EOF", async () => {
+    const res = await responses({ model: "test-terminal-open", input: "x" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).status).toBe("completed")
   })
 
   test("orders aggregated output by output_index", async () => {
@@ -384,12 +399,28 @@ describe("subby proxy", () => {
       input: [{ type: "function_call_output", call_id: "c1", output: "ok" }],
     })
     expect(res.status).toBe(200)
+    expect((await json(res)).previous_response_id).toBe(firstId)
     expect(lastBody?.previous_response_id).toBeUndefined()
     const forwarded = lastBody?.input as Record<string, unknown>[]
     expect(forwarded).toHaveLength(3)
     expect(forwarded[0]).toEqual({ role: "user", content: "turn one" })
     expect(forwarded[1]!.type).toBe("message")
     expect(forwarded[2]!.type).toBe("function_call_output")
+  })
+
+  test("preserves previous_response_id in chained streams", async () => {
+    const first = await responses({ model: "gpt-5.4", input: "turn one" })
+    const firstId = (await json(first)).id
+
+    const res = await responses({
+      model: "gpt-5.4",
+      previous_response_id: firstId,
+      input: "turn two",
+      stream: true,
+    })
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain(`"previous_response_id":"${firstId}"`)
+    expect(lastBody?.previous_response_id).toBeUndefined()
   })
 
   test("replays encrypted reasoning items when chaining", async () => {

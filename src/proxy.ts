@@ -302,7 +302,7 @@ function consumeSseEvent(chunk: string, state: ResponseStreamState): void {
   if (event.type === "error") state.error = event
 }
 
-async function aggregateResponse(upstream: Response, input: unknown[]): Promise<Response> {
+async function aggregateResponse(upstream: Response, input: unknown[], previousResponseId: string | null): Promise<Response> {
   if (!upstream.body) return errorResponse(502, "upstream returned an empty response stream")
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
@@ -318,7 +318,12 @@ async function aggregateResponse(upstream: Response, input: unknown[]): Promise<
       while (separator?.index !== undefined) {
         consumeSseEvent(buffer.slice(0, separator.index), state)
         buffer = buffer.slice(separator.index + separator[0].length)
+        if (state.terminal) break
         separator = SSE_EVENT_SEPARATOR.exec(buffer)
+      }
+      if (state.terminal) {
+        await reader.cancel().catch(() => {})
+        break
       }
     }
     buffer += decoder.decode()
@@ -333,8 +338,64 @@ async function aggregateResponse(upstream: Response, input: unknown[]): Promise<
     return errorResponse(502, `upstream stream ended without a terminal response event${detail}`)
   }
   if (!terminal.output?.length) terminal.output = [...state.items.entries()].sort(([a], [b]) => a - b).map(([, item]) => item)
+  if (previousResponseId) terminal.previous_response_id = previousResponseId
   rememberResponse(terminal, input)
   return Response.json(terminal)
+}
+
+function rewriteSsePreviousResponseId(frame: string, previousResponseId: string): string {
+  const lines = frame.split(/\r\n|\r|\n/)
+  const payload = lines
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+    .trim()
+  if (!payload || payload === "[DONE]") return frame
+
+  let event: { response?: unknown }
+  try {
+    event = JSON.parse(payload)
+  } catch {
+    return frame
+  }
+  if (!event.response || typeof event.response !== "object") return frame
+  const response = event.response as Record<string, unknown>
+  response.previous_response_id = previousResponseId
+
+  let replaced = false
+  return lines
+    .filter((line) => {
+      if (!line.startsWith("data:")) return true
+      if (replaced) return false
+      replaced = true
+      return true
+    })
+    .map((line) => line.startsWith("data:") ? `data: ${JSON.stringify(event)}` : line)
+    .join("\n")
+}
+
+function preservePreviousResponseId(upstream: Response, previousResponseId: string): Response {
+  if (!upstream.body) return passthrough(upstream)
+  const decoder = new TextDecoder()
+  const encoder = new TextEncoder()
+  let buffer = ""
+  const body = upstream.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true })
+      let separator = SSE_EVENT_SEPARATOR.exec(buffer)
+      while (separator?.index !== undefined) {
+        const frame = buffer.slice(0, separator.index)
+        buffer = buffer.slice(separator.index + separator[0].length)
+        controller.enqueue(encoder.encode(`${rewriteSsePreviousResponseId(frame, previousResponseId)}\n\n`))
+        separator = SSE_EVENT_SEPARATOR.exec(buffer)
+      }
+    },
+    flush(controller) {
+      buffer += decoder.decode()
+      if (buffer) controller.enqueue(encoder.encode(rewriteSsePreviousResponseId(buffer, previousResponseId)))
+    },
+  }))
+  return passthrough(upstream, body)
 }
 
 interface CachedResponse {
@@ -422,6 +483,9 @@ async function handleResponses(req: Request): Promise<Response> {
   } catch {
     return errorResponse(400, "invalid JSON body")
   }
+  const previousResponseId = parsed.previous_response_id === undefined || parsed.previous_response_id === null
+    ? null
+    : String(parsed.previous_response_id)
   const chainError = inlinePreviousResponse(parsed)
   if (chainError) return errorResponse(400, chainError)
   parsed.store = false
@@ -454,7 +518,8 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      return clientStream ? passthrough(res) : await aggregateResponse(res, responseInputItems(parsed.input))
+      if (clientStream) return previousResponseId ? preservePreviousResponseId(res, previousResponseId) : passthrough(res)
+      return await aggregateResponse(res, responseInputItems(parsed.input), previousResponseId)
     }
 
     const text = await res.text()
