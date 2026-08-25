@@ -202,7 +202,7 @@ describe("subby proxy", () => {
     expect(lastAccept).toBe("text/event-stream")
     expect(lastBody?.stream).toBe(true)
     const j = await json(res)
-    expect(j.id).toBe("subby_resp_1")
+    expect(j.id).toBe("resp_1")
     expect(j.output).toHaveLength(1)
   })
 
@@ -214,9 +214,25 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
-  test("aggregated responses carry a non-chainable id", async () => {
-    const res = await responses({ model: "gpt-5.4", input: "x" })
-    expect((await json(res)).id).toBe("subby_resp_1")
+  test("emulates response chaining across stateless upstream", async () => {
+    const first = await responses({ model: "gpt-5.4", input: [{ role: "user", type: "message", content: "hi" }] })
+    expect((await json(first)).id).toBe("resp_1")
+    const second = await responses({
+      model: "gpt-5.4",
+      previous_response_id: "resp_1",
+      input: [{ type: "custom_tool_call_output", call_id: "call_1", output: "done" }],
+    })
+    expect(second.status).toBe(200)
+    const sent = lastBody?.input as Record<string, unknown>[]
+    // full history: original user item + replayable output item + the tail
+    expect(sent.map((i) => i.type ?? i.role)).toEqual(["message", "message", "custom_tool_call_output"])
+    expect(lastBody).not.toHaveProperty("previous_response_id")
+  })
+
+  test("unknown previous_response_id is a clear 400", async () => {
+    const res = await responses({ model: "gpt-5.4", previous_response_id: "resp_nope", input: [] })
+    expect(res.status).toBe(400)
+    expect(((await json(res)).error as { message: string }).message).toContain("unknown previous_response_id")
   })
 
   test("defaults to aggregated non-streaming when stream is omitted", async () => {
@@ -224,7 +240,7 @@ describe("subby proxy", () => {
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
     expect(lastAccept).toBe("text/event-stream")
-    expect((await json(res)).id).toBe("subby_resp_1")
+    expect((await json(res)).id).toBe("resp_1")
   })
 
   test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {
@@ -297,10 +313,10 @@ describe("subby proxy", () => {
     expect(j2.error.message).toMatch(/used up/i)
   })
 
-  test("rejects stateless conversation chaining", async () => {
+  test("chaining to an unknown response id is rejected", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", previous_response_id: "resp_previous" })
     expect(res.status).toBe(400)
-    expect((await json(res)).error.message).toMatch(/stateless/i)
+    expect(((await json(res)).error as { message: string }).message).toContain("unknown previous_response_id")
   })
 
   test("rejects browser-safelisted content types", async () => {

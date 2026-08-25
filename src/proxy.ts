@@ -258,7 +258,24 @@ function passthrough(upstream: Response, body: string | ReadableStream<Uint8Arra
 /** Collapse an upstream SSE stream into the JSON body a non-streaming client
  *  expects: the response.completed payload, with output items filled from
  *  response.output_item.done events when the final object's output is empty. */
-async function aggregateResponse(upstream: Response): Promise<Response> {
+/** Chained-session cache: response id -> full input-item history (the
+ *  request's input plus the response's replayable output items). */
+const sessions = new Map<string, unknown[]>()
+const SESSION_LIMIT = 500
+
+function recordSession(id: string, requestInput: unknown, output: unknown[]) {
+  const base = Array.isArray(requestInput) ? requestInput : requestInput == null ? [] : [{ type: "message", role: "user", content: String(requestInput) }]
+  // Reasoning items don't replay without encrypted content; drop them.
+  const replayable = output.filter((o) => !(o && typeof o === "object" && (o as { type?: string }).type === "reasoning"))
+  sessions.set(id, [...base, ...replayable])
+  while (sessions.size > SESSION_LIMIT) {
+    const oldest = sessions.keys().next().value
+    if (oldest === undefined) break
+    sessions.delete(oldest)
+  }
+}
+
+async function aggregateResponse(upstream: Response, requestInput?: unknown): Promise<Response> {
   const reader = (upstream.body as ReadableStream<Uint8Array>).getReader()
   const decoder = new TextDecoder()
   let buf = ""
@@ -297,11 +314,8 @@ async function aggregateResponse(upstream: Response): Promise<Response> {
     return errorResponse(502, `upstream stream ended without response.completed${failed ? `: ${JSON.stringify(failed).slice(0, 300)}` : ""}`)
   }
   if (!completed.output || completed.output.length === 0) completed.output = items
-  // Hand out a non-chainable id: subby is stateless, so clients must not be
-  // tempted to send previous_response_id (which we reject) — well-behaved
-  // loops fall back to resending full history.
-  const c = completed as { id?: string }
-  if (typeof c.id === "string" && c.id.startsWith("resp_")) c.id = `subby_${c.id}`
+  const done = completed as { id?: string; output: unknown[] }
+  if (typeof done.id === "string") recordSession(done.id, requestInput, done.output)
   return Response.json(completed)
 }
 
@@ -318,8 +332,16 @@ async function handleResponses(req: Request): Promise<Response> {
   } catch {
     return errorResponse(400, "invalid JSON body")
   }
+  // The ChatGPT backend holds no server-side state, so subby emulates
+  // response chaining: aggregated exchanges are cached by response id and a
+  // previous_response_id request is reconstituted into full history.
   if (parsed.previous_response_id !== undefined && parsed.previous_response_id !== null) {
-    return errorResponse(400, "previous_response_id is unsupported because subby responses are stateless")
+    const prev = String(parsed.previous_response_id)
+    const history = sessions.get(prev)
+    if (!history) return errorResponse(400, `unknown previous_response_id ${prev} — not a subby-served response, or its session cache expired`)
+    const tail = Array.isArray(parsed.input) ? parsed.input : parsed.input == null ? [] : [{ type: "message", role: "user", content: String(parsed.input) }]
+    parsed.input = [...history, ...tail]
+    delete parsed.previous_response_id
   }
   parsed.store = false
   // Rejected as "Unsupported parameter" by (at least some) Codex accounts;
@@ -371,7 +393,7 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      return clientStream ? passthrough(res) : await aggregateResponse(res)
+      return clientStream ? passthrough(res) : await aggregateResponse(res, parsed.input)
     }
 
     const text = await res.text()
