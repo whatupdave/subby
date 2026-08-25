@@ -273,6 +273,9 @@ async function handleResponses(req: Request): Promise<Response> {
   }
   parsed.store = false
   const stream = parsed.stream === true
+  // The ChatGPT Codex backend 400s on an explicit stream:false (the OpenAI
+  // SDK sends it for typed non-streaming calls); absence is accepted.
+  if (!stream) delete parsed.stream
   const body = JSON.stringify(parsed)
 
   const attempts = Math.max(1, getSubs().filter((s) => s.provider === "codex").length)

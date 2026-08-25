@@ -168,9 +168,10 @@ describe("subby proxy", () => {
   test("supports explicit non-streaming responses", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
+    // stream:false is stripped before forwarding — the backend 400s on it
+    expect(lastBody).not.toHaveProperty("stream")
     expect(res.headers.get("content-type")).toContain("application/json")
     expect(lastAccept).toBe("application/json")
-    expect(lastBody?.stream).toBe(false)
   })
 
   test("passes through streaming responses", async () => {
