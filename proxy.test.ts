@@ -202,7 +202,7 @@ describe("subby proxy", () => {
     expect(lastAccept).toBe("text/event-stream")
     expect(lastBody?.stream).toBe(true)
     const j = await json(res)
-    expect(j.id).toBe("resp_1")
+    expect(j.id).toBe("subby_resp_1")
     expect(j.output).toHaveLength(1)
   })
 
@@ -214,12 +214,17 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
+  test("aggregated responses carry a non-chainable id", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x" })
+    expect((await json(res)).id).toBe("subby_resp_1")
+  })
+
   test("defaults to aggregated non-streaming when stream is omitted", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x" })
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
     expect(lastAccept).toBe("text/event-stream")
-    expect((await json(res)).id).toBe("resp_1")
+    expect((await json(res)).id).toBe("subby_resp_1")
   })
 
   test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {

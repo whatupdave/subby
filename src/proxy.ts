@@ -297,6 +297,11 @@ async function aggregateResponse(upstream: Response): Promise<Response> {
     return errorResponse(502, `upstream stream ended without response.completed${failed ? `: ${JSON.stringify(failed).slice(0, 300)}` : ""}`)
   }
   if (!completed.output || completed.output.length === 0) completed.output = items
+  // Hand out a non-chainable id: subby is stateless, so clients must not be
+  // tempted to send previous_response_id (which we reject) — well-behaved
+  // loops fall back to resending full history.
+  const c = completed as { id?: string }
+  if (typeof c.id === "string" && c.id.startsWith("resp_")) c.id = `subby_${c.id}`
   return Response.json(completed)
 }
 
