@@ -53,11 +53,44 @@ const upstream = Bun.serve({
       if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
         return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
       }
-      const response = { id: "resp_1", account: acct, store: body.store, model: body.model }
-      if (body.stream) {
-        return new Response(`data: ${JSON.stringify(response)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
+      if (!body.stream) return Response.json({ detail: "Stream must be set to true" }, { status: 400 })
+      const status = body.model === "test-incomplete" ? "incomplete" : body.model === "test-failed" ? "failed" : "completed"
+      const response = {
+        id: "resp_1",
+        account: acct,
+        store: body.store,
+        model: body.model,
+        status,
+        output: [],
+        previous_response_id: null,
+        error: status === "failed" ? { code: "server_error", message: "generation failed" } : null,
+        incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
       }
-      return Response.json(response)
+      const outputItems = body.model === "test-reversed"
+        ? [
+            { output_index: 1, item: { type: "message", content: "second" } },
+            { output_index: 0, item: { type: "message", content: "first" } },
+          ]
+        : body.model === "test-reasoning"
+          ? [
+              { output_index: 0, item: { type: "reasoning", encrypted_content: "encrypted" } },
+              { output_index: 1, item: { type: "function_call", call_id: "c1", name: "lookup", arguments: "{}" } },
+            ]
+          : [{ output_index: 0, item: { type: "message", account: acct } }]
+      const events = status === "failed"
+        ? []
+        : outputItems.map(({ output_index, item }) => `data: ${JSON.stringify({ type: "response.output_item.done", output_index, item })}`)
+      events.push(`data: ${JSON.stringify({ type: `response.${status}`, response })}`, "data: [DONE]")
+      const separator = body.model === "test-cr-framing" ? "\r\r" : "\r\n\r\n"
+      const payload = `${events.join(separator)}${separator}`
+      if (body.model === "test-terminal-open") {
+        return new Response(new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode(payload))
+          },
+        }), { headers: { "content-type": "text/event-stream" } })
+      }
+      return new Response(payload, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response("not found", { status: 404 })
   },
@@ -165,12 +198,41 @@ describe("subby proxy", () => {
     expect(j.store).toBe(false)
   })
 
-  test("supports explicit non-streaming responses", async () => {
+  test("aggregates SSE into JSON for explicit non-streaming clients", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
-    expect(lastAccept).toBe("application/json")
-    expect(lastBody?.stream).toBe(false)
+    expect(lastAccept).toBe("text/event-stream")
+    expect(lastBody?.stream).toBe(true)
+    const j = await json(res)
+    expect(j.id).toBe("resp_1")
+    expect(j.output).toHaveLength(1)
+  })
+
+  test("preserves incomplete and failed terminal responses", async () => {
+    for (const [model, status] of [["test-incomplete", "incomplete"], ["test-failed", "failed"]]) {
+      const res = await responses({ model, input: "x" })
+      expect(res.status).toBe(200)
+      expect((await json(res)).status).toBe(status)
+    }
+  })
+
+  test("returns after a terminal event without waiting for upstream EOF", async () => {
+    const res = await responses({ model: "test-terminal-open", input: "x" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).status).toBe("completed")
+  })
+
+  test("orders aggregated output by output_index", async () => {
+    const res = await responses({ model: "test-reversed", input: "x" })
+    const output = (await json(res)).output as { content: string }[]
+    expect(output.map((item) => item.content)).toEqual(["first", "second"])
+  })
+
+  test("accepts CR-only SSE framing", async () => {
+    const res = await responses({ model: "test-cr-framing", input: "x" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).status).toBe("completed")
   })
 
   test("passes through streaming responses", async () => {
@@ -181,11 +243,13 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
-  test("defaults to non-streaming when stream is omitted", async () => {
+  test("defaults to aggregated non-streaming when stream is omitted", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x" })
     expect(res.status).toBe(200)
-    expect(lastAccept).toBe("application/json")
-    expect(lastBody).not.toHaveProperty("stream")
+    expect(res.headers.get("content-type")).toContain("application/json")
+    expect(lastAccept).toBe("text/event-stream")
+    expect(lastBody?.stream).toBe(true)
+    expect((await json(res)).id).toBe("resp_1")
   })
 
   test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {
@@ -258,10 +322,10 @@ describe("subby proxy", () => {
     expect(j2.error.message).toMatch(/used up/i)
   })
 
-  test("rejects stateless conversation chaining", async () => {
+  test("rejects chaining off a response it has never served", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", previous_response_id: "resp_previous" })
     expect(res.status).toBe(400)
-    expect((await json(res)).error.message).toMatch(/stateless/i)
+    expect((await json(res)).error.message).toMatch(/unknown previous_response_id/i)
   })
 
   test("rejects browser-safelisted content types", async () => {
@@ -290,5 +354,92 @@ describe("subby proxy", () => {
   test("unknown route 404s", async () => {
     const res = await fetch(`${base}/v1/chat/completions`, { method: "POST", body: "{}" })
     expect(res.status).toBe(404)
+  })
+
+  test("normalizes regular-API requests for the codex backend", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const res = await responses({
+      model: "gpt-5.5",
+      prompt_cache_key: "k",
+      prompt_cache_retention: "24h",
+      prompt_cache_options: { mode: "explicit" },
+      max_output_tokens: 64,
+      input: [
+        {
+          role: "system",
+          type: "message",
+          prompt_cache_breakpoint: { mode: "explicit" },
+          content: [{ type: "input_text", text: "sys", prompt_cache_breakpoint: { mode: "explicit" } }],
+        },
+        { role: "user", content: [{ type: "input_text", text: "hi" }] },
+      ],
+    })
+    expect(res.status).toBe(200)
+    expect(lastBody?.prompt_cache_key).toBeUndefined()
+    expect(lastBody?.prompt_cache_retention).toBeUndefined()
+    expect(lastBody?.prompt_cache_options).toBeUndefined()
+    expect(lastBody?.max_output_tokens).toBeUndefined()
+    const input = lastBody?.input as Record<string, unknown>[]
+    expect(input[0]!.role).toBe("developer")
+    expect(input[0]!.prompt_cache_breakpoint).toBeUndefined()
+    const part = (input[0]!.content as Record<string, unknown>[])[0]!
+    expect(part.prompt_cache_breakpoint).toBeUndefined()
+    expect(input[1]!.role).toBe("user")
+  })
+
+  test("emulates previous_response_id chaining by inlining the cached transcript", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const first = await responses({ model: "gpt-5.4", input: "turn one" })
+    const firstId = (await json(first)).id
+    expect(firstId).toBe("resp_1")
+
+    const res = await responses({
+      model: "gpt-5.4",
+      previous_response_id: firstId,
+      input: [{ type: "function_call_output", call_id: "c1", output: "ok" }],
+    })
+    expect(res.status).toBe(200)
+    expect((await json(res)).previous_response_id).toBe(firstId)
+    expect(lastBody?.previous_response_id).toBeUndefined()
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded).toHaveLength(3)
+    expect(forwarded[0]).toEqual({ role: "user", content: "turn one" })
+    expect(forwarded[1]!.type).toBe("message")
+    expect(forwarded[2]!.type).toBe("function_call_output")
+  })
+
+  test("preserves previous_response_id in chained streams", async () => {
+    const first = await responses({ model: "gpt-5.4", input: "turn one" })
+    const firstId = (await json(first)).id
+
+    const res = await responses({
+      model: "gpt-5.4",
+      previous_response_id: firstId,
+      input: "turn two",
+      stream: true,
+    })
+    expect(res.status).toBe(200)
+    expect(await res.text()).toContain(`"previous_response_id":"${firstId}"`)
+    expect(lastBody?.previous_response_id).toBeUndefined()
+  })
+
+  test("replays encrypted reasoning items when chaining", async () => {
+    const first = await responses({
+      model: "test-reasoning",
+      input: "investigate",
+      include: ["reasoning.encrypted_content"],
+    })
+    const firstId = (await json(first)).id
+
+    const res = await responses({
+      model: "test-reasoning",
+      previous_response_id: firstId,
+      input: [{ type: "function_call_output", call_id: "c1", output: "result" }],
+    })
+    expect(res.status).toBe(200)
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded[1]).toEqual({ type: "reasoning", encrypted_content: "encrypted" })
+    expect(forwarded[2]!.type).toBe("function_call")
+    expect(forwarded[3]!.type).toBe("function_call_output")
   })
 })

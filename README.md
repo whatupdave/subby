@@ -47,7 +47,9 @@ curl http://127.0.0.1:8787/v1/responses \
   }'
 ```
 
-The proxy forces `store: false`, as required by the ChatGPT Codex backend. Responses are stateless, so `previous_response_id` conversation chaining is not supported.
+The Codex backend only streams and requires `store: false`. For non-streaming clients, subby aggregates the upstream SSE events into a JSON Response object.
+
+Subby emulates `previous_response_id` for non-streaming responses with a bounded in-memory transcript cache. Chaining from a streaming response or an ID created before restart returns a clear 400 error.
 
 Legacy `POST /v1/chat/completions` is not currently implemented.
 
