@@ -255,6 +255,51 @@ function passthrough(upstream: Response, body: string | ReadableStream<Uint8Arra
   return new Response(body, { status: upstream.status, headers })
 }
 
+/** Collapse an upstream SSE stream into the JSON body a non-streaming client
+ *  expects: the response.completed payload, with output items filled from
+ *  response.output_item.done events when the final object's output is empty. */
+async function aggregateResponse(upstream: Response): Promise<Response> {
+  const reader = (upstream.body as ReadableStream<Uint8Array>).getReader()
+  const decoder = new TextDecoder()
+  let buf = ""
+  let completed: { output?: unknown[] } | null = null
+  let failed: unknown = null
+  const items: unknown[] = []
+  const consume = (chunk: string) => {
+    for (const line of chunk.split("\n")) {
+      if (!line.startsWith("data:")) continue
+      const payload = line.slice(5).trim()
+      if (payload === "" || payload === "[DONE]") continue
+      let event: { type?: string; response?: unknown; item?: unknown }
+      try {
+        event = JSON.parse(payload) as typeof event
+      } catch {
+        continue
+      }
+      if (event.type === "response.output_item.done" && event.item !== undefined) items.push(event.item)
+      if (event.type === "response.completed") completed = event.response as typeof completed
+      if (event.type === "response.failed" || event.type === "error") failed = event
+    }
+  }
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx = buf.indexOf("\n\n")
+    while (idx !== -1) {
+      consume(buf.slice(0, idx))
+      buf = buf.slice(idx + 2)
+      idx = buf.indexOf("\n\n")
+    }
+  }
+  if (buf.trim() !== "") consume(buf)
+  if (!completed) {
+    return errorResponse(502, `upstream stream ended without response.completed${failed ? `: ${JSON.stringify(failed).slice(0, 300)}` : ""}`)
+  }
+  if (!completed.output || completed.output.length === 0) completed.output = items
+  return Response.json(completed)
+}
+
 async function handleResponses(req: Request): Promise<Response> {
   const inBody = await req.text()
 
@@ -272,10 +317,11 @@ async function handleResponses(req: Request): Promise<Response> {
     return errorResponse(400, "previous_response_id is unsupported because subby responses are stateless")
   }
   parsed.store = false
-  const stream = parsed.stream === true
-  // The ChatGPT Codex backend 400s on an explicit stream:false (the OpenAI
-  // SDK sends it for typed non-streaming calls); absence is accepted.
-  if (!stream) delete parsed.stream
+  // Whether the backend accepts non-SSE responses varies by account, so the
+  // only account-independent path is to ALWAYS stream upstream and aggregate
+  // the SSE into plain JSON for non-streaming clients.
+  const clientStream = parsed.stream === true
+  parsed.stream = true
   const body = JSON.stringify(parsed)
 
   const attempts = Math.max(1, getSubs().filter((s) => s.provider === "codex").length)
@@ -285,7 +331,7 @@ async function handleResponses(req: Request): Promise<Response> {
     const sub = await pickSub(req.signal)
     let res: Response
     try {
-      res = await forward(sub, body, stream, req.signal)
+      res = await forward(sub, body, true, req.signal)
     } catch (e) {
       state.lastError = e instanceof Error ? e.message : String(e)
       if (e instanceof AccountAuthError) {
@@ -300,7 +346,7 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      return passthrough(res)
+      return clientStream ? passthrough(res) : await aggregateResponse(res)
     }
 
     const text = await res.text()

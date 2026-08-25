@@ -53,11 +53,14 @@ const upstream = Bun.serve({
       if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
         return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
       }
-      const response = { id: "resp_1", account: acct, store: body.store, model: body.model }
-      if (body.stream) {
-        return new Response(`data: ${JSON.stringify(response)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-      }
-      return Response.json(response)
+      if (!body.stream) return Response.json({ detail: "Stream must be set to true" }, { status: 400 })
+      const response = { id: "resp_1", account: acct, store: body.store, model: body.model, output: [] }
+      const events = [
+        `data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", account: acct } })}`,
+        `data: ${JSON.stringify({ type: "response.completed", response })}`,
+        "data: [DONE]",
+      ]
+      return new Response(`${events.join("\n\n")}\n\n`, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response("not found", { status: 404 })
   },
@@ -165,13 +168,16 @@ describe("subby proxy", () => {
     expect(j.store).toBe(false)
   })
 
-  test("supports explicit non-streaming responses", async () => {
+  test("aggregates SSE into JSON for non-streaming clients", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
-    // stream:false is stripped before forwarding — the backend 400s on it
-    expect(lastBody).not.toHaveProperty("stream")
     expect(res.headers.get("content-type")).toContain("application/json")
-    expect(lastAccept).toBe("application/json")
+    // upstream acceptance of non-SSE varies by account: always stream up
+    expect(lastAccept).toBe("text/event-stream")
+    expect(lastBody?.stream).toBe(true)
+    const j = await json(res)
+    expect(j.id).toBe("resp_1")
+    expect(j.output).toHaveLength(1)
   })
 
   test("passes through streaming responses", async () => {
@@ -182,11 +188,12 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
-  test("defaults to non-streaming when stream is omitted", async () => {
+  test("defaults to aggregated non-streaming when stream is omitted", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x" })
     expect(res.status).toBe(200)
-    expect(lastAccept).toBe("application/json")
-    expect(lastBody).not.toHaveProperty("stream")
+    expect(res.headers.get("content-type")).toContain("application/json")
+    expect(lastAccept).toBe("text/event-stream")
+    expect((await json(res)).id).toBe("resp_1")
   })
 
   test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {
