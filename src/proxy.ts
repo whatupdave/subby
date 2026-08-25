@@ -324,7 +324,14 @@ async function handleResponses(req: Request): Promise<Response> {
   delete parsed.prompt_cache_options
   if (Array.isArray(parsed.input)) {
     for (const item of parsed.input) {
-      if (item && typeof item === "object") delete (item as Record<string, unknown>).prompt_cache_breakpoint
+      if (!item || typeof item !== "object") continue
+      delete (item as Record<string, unknown>).prompt_cache_breakpoint
+      const content = (item as Record<string, unknown>).content
+      if (Array.isArray(content)) {
+        for (const part of content) {
+          if (part && typeof part === "object") delete (part as Record<string, unknown>).prompt_cache_breakpoint
+        }
+      }
     }
   }
   // Whether the backend accepts non-SSE responses varies by account, so the

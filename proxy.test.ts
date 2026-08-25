@@ -178,12 +178,18 @@ describe("subby proxy", () => {
   test("strips prompt_cache_breakpoint markers from input items", async () => {
     const res = await responses({
       model: "gpt-5.4",
-      input: [{ role: "user", type: "message", content: "x", prompt_cache_breakpoint: { mode: "explicit" } }],
+      input: [
+        { role: "user", type: "message", content: "x", prompt_cache_breakpoint: { mode: "explicit" } },
+        { role: "system", type: "message", content: [{ type: "input_text", text: "y", prompt_cache_breakpoint: { mode: "explicit" } }] },
+      ],
     })
     expect(res.status).toBe(200)
     const items = lastBody?.input as Record<string, unknown>[]
     expect(items[0]).not.toHaveProperty("prompt_cache_breakpoint")
     expect(items[0]?.content).toBe("x")
+    const parts = items[1]?.content as Record<string, unknown>[]
+    expect(parts[0]).not.toHaveProperty("prompt_cache_breakpoint")
+    expect(parts[0]?.text).toBe("y")
   })
 
   test("aggregates SSE into JSON for non-streaming clients", async () => {
