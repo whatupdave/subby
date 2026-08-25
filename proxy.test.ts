@@ -53,11 +53,14 @@ const upstream = Bun.serve({
       if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
         return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
       }
-      const response = { id: "resp_1", account: acct, store: body.store, model: body.model }
-      if (body.stream) {
-        return new Response(`data: ${JSON.stringify(response)}\n\ndata: [DONE]\n\n`, { headers: { "content-type": "text/event-stream" } })
-      }
-      return Response.json(response)
+      if (!body.stream) return Response.json({ detail: "Stream must be set to true" }, { status: 400 })
+      const response = { id: "resp_1", account: acct, store: body.store, model: body.model, output: [] }
+      const events = [
+        `data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", account: acct } })}`,
+        `data: ${JSON.stringify({ type: "response.completed", response })}`,
+        "data: [DONE]",
+      ]
+      return new Response(`${events.join("\r\n\r\n")}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response("not found", { status: 404 })
   },
@@ -165,12 +168,17 @@ describe("subby proxy", () => {
     expect(j.store).toBe(false)
   })
 
-  test("supports explicit non-streaming responses", async () => {
+  test("aggregates SSE into JSON for explicit non-streaming clients", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
-    expect(lastAccept).toBe("application/json")
-    expect(lastBody?.stream).toBe(false)
+    // the Codex backend only serves SSE, so upstream is always streamed
+    expect(lastAccept).toBe("text/event-stream")
+    expect(lastBody?.stream).toBe(true)
+    const j = await json(res)
+    expect(j.id).toBe("resp_1")
+    // output filled from response.output_item.done when completed.output is empty
+    expect(j.output).toHaveLength(1)
   })
 
   test("passes through streaming responses", async () => {
@@ -181,11 +189,13 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
-  test("defaults to non-streaming when stream is omitted", async () => {
+  test("defaults to aggregated non-streaming when stream is omitted", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x" })
     expect(res.status).toBe(200)
-    expect(lastAccept).toBe("application/json")
-    expect(lastBody).not.toHaveProperty("stream")
+    expect(res.headers.get("content-type")).toContain("application/json")
+    expect(lastAccept).toBe("text/event-stream")
+    expect(lastBody?.stream).toBe(true)
+    expect((await json(res)).id).toBe("resp_1")
   })
 
   test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {
@@ -258,10 +268,10 @@ describe("subby proxy", () => {
     expect(j2.error.message).toMatch(/used up/i)
   })
 
-  test("rejects stateless conversation chaining", async () => {
+  test("rejects chaining off a response it has never served", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", previous_response_id: "resp_previous" })
     expect(res.status).toBe(400)
-    expect((await json(res)).error.message).toMatch(/stateless/i)
+    expect((await json(res)).error.message).toMatch(/unknown previous_response_id/i)
   })
 
   test("rejects browser-safelisted content types", async () => {
@@ -290,5 +300,58 @@ describe("subby proxy", () => {
   test("unknown route 404s", async () => {
     const res = await fetch(`${base}/v1/chat/completions`, { method: "POST", body: "{}" })
     expect(res.status).toBe(404)
+  })
+
+  test("normalizes regular-API requests for the codex backend", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const res = await responses({
+      model: "gpt-5.5",
+      prompt_cache_key: "k",
+      prompt_cache_retention: "24h",
+      prompt_cache_options: { mode: "explicit" },
+      input: [
+        {
+          role: "system",
+          type: "message",
+          content: [{ type: "input_text", text: "sys", prompt_cache_breakpoint: { mode: "explicit" } }],
+        },
+        { role: "user", content: [{ type: "input_text", text: "hi" }] },
+      ],
+    })
+    expect(res.status).toBe(200)
+    expect(lastBody?.prompt_cache_key).toBeUndefined()
+    expect(lastBody?.prompt_cache_retention).toBeUndefined()
+    expect(lastBody?.prompt_cache_options).toBeUndefined()
+    const input = lastBody?.input as Record<string, unknown>[]
+    expect(input[0]!.role).toBe("developer")
+    const part = (input[0]!.content as Record<string, unknown>[])[0]!
+    expect(part.prompt_cache_breakpoint).toBeUndefined()
+    expect(input[1]!.role).toBe("user")
+  })
+
+  test("emulates previous_response_id chaining by inlining the cached transcript", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const first = await responses({ model: "gpt-5.4", input: "turn one" })
+    const firstId = (await json(first)).id
+    expect(firstId).toBe("resp_1")
+
+    const res = await responses({
+      model: "gpt-5.4",
+      previous_response_id: firstId,
+      input: [{ type: "function_call_output", call_id: "c1", output: "ok" }],
+    })
+    expect(res.status).toBe(200)
+    expect(lastBody?.previous_response_id).toBeUndefined()
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded).toHaveLength(3)
+    expect(forwarded[0]).toEqual({ role: "user", content: "turn one" })
+    expect(forwarded[1]!.type).toBe("message")
+    expect(forwarded[2]!.type).toBe("function_call_output")
+  })
+
+  test("rejects an unknown previous_response_id after the emulation cache is bypassed", async () => {
+    const res = await responses({ model: "gpt-5.4", previous_response_id: "resp_from_before_restart", input: "hi" })
+    expect(res.status).toBe(400)
+    expect((await json(res)).error.message).toMatch(/unknown previous_response_id/)
   })
 })

@@ -255,6 +255,140 @@ function passthrough(upstream: Response, body: string | ReadableStream<Uint8Arra
   return new Response(body, { status: upstream.status, headers })
 }
 
+interface CompletedResponse {
+  id?: unknown
+  output?: unknown[]
+  [key: string]: unknown
+}
+
+interface ResponseStreamState {
+  completed?: CompletedResponse
+  failed?: unknown
+  items: unknown[]
+}
+
+function consumeSseEvent(chunk: string, state: ResponseStreamState): void {
+  const payload = chunk
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+    .trim()
+  if (!payload || payload === "[DONE]") return
+
+  let event: { type?: string; response?: unknown; item?: unknown }
+  try {
+    event = JSON.parse(payload)
+  } catch {
+    return
+  }
+  if (event.type === "response.output_item.done" && event.item !== undefined) state.items.push(event.item)
+  if (event.type === "response.completed" && event.response && typeof event.response === "object") {
+    state.completed = event.response as CompletedResponse
+  }
+  if (event.type === "response.failed" || event.type === "error") state.failed = event
+}
+
+async function aggregateResponse(upstream: Response, input: unknown[]): Promise<Response> {
+  if (!upstream.body) return errorResponse(502, "upstream returned an empty response stream")
+  const reader = upstream.body.getReader()
+  const decoder = new TextDecoder()
+  const state: ResponseStreamState = { items: [] }
+  let buffer = ""
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let separator = /\r?\n\r?\n/.exec(buffer)
+    while (separator?.index !== undefined) {
+      consumeSseEvent(buffer.slice(0, separator.index), state)
+      buffer = buffer.slice(separator.index + separator[0].length)
+      separator = /\r?\n\r?\n/.exec(buffer)
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) consumeSseEvent(buffer, state)
+
+  const completed = state.completed
+  if (!completed) {
+    const detail = state.failed ? `: ${JSON.stringify(state.failed).slice(0, 300)}` : ""
+    return errorResponse(502, `upstream stream ended without response.completed${detail}`)
+  }
+  if (!completed.output?.length) completed.output = state.items
+  rememberResponse(completed, input)
+  return Response.json(completed)
+}
+
+interface CachedResponse {
+  input: unknown[]
+  output: unknown[]
+  bytes: number
+}
+
+const responseCache = new Map<string, CachedResponse>()
+const RESPONSE_CACHE_MAX_ENTRIES = 100
+const RESPONSE_CACHE_MAX_BYTES = 16 * 1024 * 1024
+let responseCacheBytes = 0
+
+function responseInputItems(input: unknown): unknown[] {
+  if (Array.isArray(input)) return input
+  if (input === undefined || input === null) return []
+  if (typeof input === "string") return [{ role: "user", content: input }]
+  return [input]
+}
+
+function rememberResponse(completed: CompletedResponse, input: unknown[]): void {
+  if (typeof completed.id !== "string" || !Array.isArray(completed.output)) return
+  const bytes = Buffer.byteLength(JSON.stringify([input, completed.output]))
+  if (bytes > RESPONSE_CACHE_MAX_BYTES) return
+
+  const existing = responseCache.get(completed.id)
+  if (existing) {
+    responseCacheBytes -= existing.bytes
+    responseCache.delete(completed.id)
+  }
+  responseCache.set(completed.id, { input, output: completed.output, bytes })
+  responseCacheBytes += bytes
+
+  while (responseCache.size > RESPONSE_CACHE_MAX_ENTRIES || responseCacheBytes > RESPONSE_CACHE_MAX_BYTES) {
+    const oldestId = responseCache.keys().next().value
+    if (oldestId === undefined) break
+    responseCacheBytes -= responseCache.get(oldestId)!.bytes
+    responseCache.delete(oldestId)
+  }
+}
+
+function inlinePreviousResponse(parsed: Record<string, unknown>): string | null {
+  if (parsed.previous_response_id === undefined || parsed.previous_response_id === null) return null
+  const id = String(parsed.previous_response_id)
+  const prior = responseCache.get(id)
+  if (!prior) {
+    return "unknown previous_response_id: subby only caches non-streaming responses from this process"
+  }
+  responseCache.delete(id)
+  responseCache.set(id, prior)
+  parsed.input = [...prior.input, ...prior.output, ...responseInputItems(parsed.input)]
+  delete parsed.previous_response_id
+  return null
+}
+
+function normalizeForCodexBackend(parsed: Record<string, unknown>): void {
+  delete parsed.prompt_cache_key
+  delete parsed.prompt_cache_retention
+  delete parsed.prompt_cache_options
+  if (!Array.isArray(parsed.input)) return
+  for (const item of parsed.input) {
+    if (!item || typeof item !== "object") continue
+    const message = item as Record<string, unknown>
+    if (message.role === "system") message.role = "developer"
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (part && typeof part === "object") delete (part as Record<string, unknown>).prompt_cache_breakpoint
+    }
+  }
+}
+
 async function handleResponses(req: Request): Promise<Response> {
   const inBody = await req.text()
 
@@ -268,11 +402,14 @@ async function handleResponses(req: Request): Promise<Response> {
   } catch {
     return errorResponse(400, "invalid JSON body")
   }
-  if (parsed.previous_response_id !== undefined && parsed.previous_response_id !== null) {
-    return errorResponse(400, "previous_response_id is unsupported because subby responses are stateless")
-  }
+  const chainError = inlinePreviousResponse(parsed)
+  if (chainError) return errorResponse(400, chainError)
   parsed.store = false
-  const stream = parsed.stream === true
+  normalizeForCodexBackend(parsed)
+  // The ChatGPT Codex backend only serves SSE ("Stream must be set to true"),
+  // so always stream upstream and aggregate for non-streaming clients.
+  const clientStream = parsed.stream === true
+  parsed.stream = true
   const body = JSON.stringify(parsed)
 
   const attempts = Math.max(1, getSubs().filter((s) => s.provider === "codex").length)
@@ -282,7 +419,7 @@ async function handleResponses(req: Request): Promise<Response> {
     const sub = await pickSub(req.signal)
     let res: Response
     try {
-      res = await forward(sub, body, stream, req.signal)
+      res = await forward(sub, body, true, req.signal)
     } catch (e) {
       state.lastError = e instanceof Error ? e.message : String(e)
       if (e instanceof AccountAuthError) {
@@ -297,7 +434,9 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      return passthrough(res)
+      return clientStream
+        ? passthrough(res)
+        : await aggregateResponse(res, responseInputItems(parsed.input))
     }
 
     const text = await res.text()
