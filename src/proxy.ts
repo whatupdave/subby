@@ -318,8 +318,15 @@ async function handleResponses(req: Request): Promise<Response> {
   }
   parsed.store = false
   // Rejected as "Unsupported parameter" by (at least some) Codex accounts;
-  // prompt_cache_key itself is supported and kept.
+  // prompt_cache_key itself is supported and kept. Breakpoint markers on
+  // input items are likewise unsupported ("prompt_cache_breakpoint is not
+  // supported on this model").
   delete parsed.prompt_cache_options
+  if (Array.isArray(parsed.input)) {
+    for (const item of parsed.input) {
+      if (item && typeof item === "object") delete (item as Record<string, unknown>).prompt_cache_breakpoint
+    }
+  }
   // Whether the backend accepts non-SSE responses varies by account, so the
   // only account-independent path is to ALWAYS stream upstream and aggregate
   // the SSE into plain JSON for non-streaming clients.
