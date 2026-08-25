@@ -317,6 +317,9 @@ async function handleResponses(req: Request): Promise<Response> {
     return errorResponse(400, "previous_response_id is unsupported because subby responses are stateless")
   }
   parsed.store = false
+  // Rejected as "Unsupported parameter" by (at least some) Codex accounts;
+  // prompt_cache_key itself is supported and kept.
+  delete parsed.prompt_cache_options
   // Whether the backend accepts non-SSE responses varies by account, so the
   // only account-independent path is to ALWAYS stream upstream and aggregate
   // the SSE into plain JSON for non-streaming clients.

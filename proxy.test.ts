@@ -168,6 +168,13 @@ describe("subby proxy", () => {
     expect(j.store).toBe(false)
   })
 
+  test("strips prompt_cache_options some codex accounts reject", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "x", prompt_cache_key: "k", prompt_cache_options: { ttl: "1h" } })
+    expect(res.status).toBe(200)
+    expect(lastBody).not.toHaveProperty("prompt_cache_options")
+    expect(lastBody?.prompt_cache_key).toBe("k")
+  })
+
   test("aggregates SSE into JSON for non-streaming clients", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
