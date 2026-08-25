@@ -255,68 +255,144 @@ function passthrough(upstream: Response, body: string | ReadableStream<Uint8Arra
   return new Response(body, { status: upstream.status, headers })
 }
 
-/** Collapse an upstream SSE stream into the JSON body a non-streaming client
- *  expects: the response.completed payload, with output items filled from
- *  response.output_item.done events when the final object's output is empty. */
-/** Chained-session cache: response id -> full input-item history (the
- *  request's input plus the response's replayable output items). */
-const sessions = new Map<string, unknown[]>()
-const SESSION_LIMIT = 500
-
-function recordSession(id: string, requestInput: unknown, output: unknown[]) {
-  const base = Array.isArray(requestInput) ? requestInput : requestInput == null ? [] : [{ type: "message", role: "user", content: String(requestInput) }]
-  // Reasoning items don't replay without encrypted content; drop them.
-  const replayable = output.filter((o) => !(o && typeof o === "object" && (o as { type?: string }).type === "reasoning"))
-  sessions.set(id, [...base, ...replayable])
-  while (sessions.size > SESSION_LIMIT) {
-    const oldest = sessions.keys().next().value
-    if (oldest === undefined) break
-    sessions.delete(oldest)
-  }
+interface CompletedResponse {
+  id?: unknown
+  output?: unknown[]
+  [key: string]: unknown
 }
 
-async function aggregateResponse(upstream: Response, requestInput?: unknown): Promise<Response> {
-  const reader = (upstream.body as ReadableStream<Uint8Array>).getReader()
-  const decoder = new TextDecoder()
-  let buf = ""
-  let completed: { output?: unknown[] } | null = null
-  let failed: unknown = null
-  const items: unknown[] = []
-  const consume = (chunk: string) => {
-    for (const line of chunk.split("\n")) {
-      if (!line.startsWith("data:")) continue
-      const payload = line.slice(5).trim()
-      if (payload === "" || payload === "[DONE]") continue
-      let event: { type?: string; response?: unknown; item?: unknown }
-      try {
-        event = JSON.parse(payload) as typeof event
-      } catch {
-        continue
-      }
-      if (event.type === "response.output_item.done" && event.item !== undefined) items.push(event.item)
-      if (event.type === "response.completed") completed = event.response as typeof completed
-      if (event.type === "response.failed" || event.type === "error") failed = event
-    }
+interface ResponseStreamState {
+  completed?: CompletedResponse
+  failed?: unknown
+  items: unknown[]
+}
+
+function consumeSseEvent(chunk: string, state: ResponseStreamState): void {
+  const payload = chunk
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trimStart())
+    .join("\n")
+    .trim()
+  if (!payload || payload === "[DONE]") return
+
+  let event: { type?: string; response?: unknown; item?: unknown }
+  try {
+    event = JSON.parse(payload)
+  } catch {
+    return
   }
+  if (event.type === "response.output_item.done" && event.item !== undefined) state.items.push(event.item)
+  if (event.type === "response.completed" && event.response && typeof event.response === "object") {
+    state.completed = event.response as CompletedResponse
+  }
+  if (event.type === "response.failed" || event.type === "error") state.failed = event
+}
+
+async function aggregateResponse(upstream: Response, input: unknown[]): Promise<Response> {
+  if (!upstream.body) return errorResponse(502, "upstream returned an empty response stream")
+  const reader = upstream.body.getReader()
+  const decoder = new TextDecoder()
+  const state: ResponseStreamState = { items: [] }
+  let buffer = ""
+
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
-    buf += decoder.decode(value, { stream: true })
-    let idx = buf.indexOf("\n\n")
-    while (idx !== -1) {
-      consume(buf.slice(0, idx))
-      buf = buf.slice(idx + 2)
-      idx = buf.indexOf("\n\n")
+    buffer += decoder.decode(value, { stream: true })
+    let separator = /\r?\n\r?\n/.exec(buffer)
+    while (separator?.index !== undefined) {
+      consumeSseEvent(buffer.slice(0, separator.index), state)
+      buffer = buffer.slice(separator.index + separator[0].length)
+      separator = /\r?\n\r?\n/.exec(buffer)
     }
   }
-  if (buf.trim() !== "") consume(buf)
+  buffer += decoder.decode()
+  if (buffer.trim()) consumeSseEvent(buffer, state)
+
+  const completed = state.completed
   if (!completed) {
-    return errorResponse(502, `upstream stream ended without response.completed${failed ? `: ${JSON.stringify(failed).slice(0, 300)}` : ""}`)
+    const detail = state.failed ? `: ${JSON.stringify(state.failed).slice(0, 300)}` : ""
+    return errorResponse(502, `upstream stream ended without response.completed${detail}`)
   }
-  if (!completed.output || completed.output.length === 0) completed.output = items
-  const done = completed as { id?: string; output: unknown[] }
-  if (typeof done.id === "string") recordSession(done.id, requestInput, done.output)
+  if (!completed.output?.length) completed.output = state.items
+  rememberResponse(completed, input)
   return Response.json(completed)
+}
+
+interface CachedResponse {
+  input: unknown[]
+  output: unknown[]
+  bytes: number
+}
+
+const responseCache = new Map<string, CachedResponse>()
+const RESPONSE_CACHE_MAX_ENTRIES = 100
+const RESPONSE_CACHE_MAX_BYTES = 16 * 1024 * 1024
+let responseCacheBytes = 0
+
+function responseInputItems(input: unknown): unknown[] {
+  if (Array.isArray(input)) return input
+  if (input === undefined || input === null) return []
+  if (typeof input === "string") return [{ role: "user", content: input }]
+  return [input]
+}
+
+function rememberResponse(completed: CompletedResponse, input: unknown[]): void {
+  if (typeof completed.id !== "string" || !Array.isArray(completed.output)) return
+  // Reasoning items cannot be replayed without encrypted content.
+  const output = completed.output.filter(
+    (item) => !(item && typeof item === "object" && (item as { type?: unknown }).type === "reasoning"),
+  )
+  const bytes = Buffer.byteLength(JSON.stringify([input, output]))
+  if (bytes > RESPONSE_CACHE_MAX_BYTES) return
+
+  const existing = responseCache.get(completed.id)
+  if (existing) {
+    responseCacheBytes -= existing.bytes
+    responseCache.delete(completed.id)
+  }
+  responseCache.set(completed.id, { input, output, bytes })
+  responseCacheBytes += bytes
+
+  while (responseCache.size > RESPONSE_CACHE_MAX_ENTRIES || responseCacheBytes > RESPONSE_CACHE_MAX_BYTES) {
+    const oldestId = responseCache.keys().next().value
+    if (oldestId === undefined) break
+    responseCacheBytes -= responseCache.get(oldestId)!.bytes
+    responseCache.delete(oldestId)
+  }
+}
+
+function inlinePreviousResponse(parsed: Record<string, unknown>): string | null {
+  if (parsed.previous_response_id === undefined || parsed.previous_response_id === null) return null
+  const id = String(parsed.previous_response_id)
+  const prior = responseCache.get(id)
+  if (!prior) {
+    return "unknown previous_response_id: subby only caches non-streaming responses from this process"
+  }
+  responseCache.delete(id)
+  responseCache.set(id, prior)
+  parsed.input = [...prior.input, ...prior.output, ...responseInputItems(parsed.input)]
+  delete parsed.previous_response_id
+  return null
+}
+
+function normalizeForCodexBackend(parsed: Record<string, unknown>): void {
+  delete parsed.prompt_cache_key
+  delete parsed.prompt_cache_retention
+  delete parsed.prompt_cache_options
+  delete parsed.max_output_tokens
+  if (!Array.isArray(parsed.input)) return
+  for (const item of parsed.input) {
+    if (!item || typeof item !== "object") continue
+    const message = item as Record<string, unknown>
+    if (message.role === "system") message.role = "developer"
+    delete message.prompt_cache_breakpoint
+    if (!Array.isArray(message.content)) continue
+    for (const part of message.content) {
+      if (part && typeof part === "object") delete (part as Record<string, unknown>).prompt_cache_breakpoint
+    }
+  }
 }
 
 async function handleResponses(req: Request): Promise<Response> {
@@ -332,42 +408,12 @@ async function handleResponses(req: Request): Promise<Response> {
   } catch {
     return errorResponse(400, "invalid JSON body")
   }
-  // The ChatGPT backend holds no server-side state, so subby emulates
-  // response chaining: aggregated exchanges are cached by response id and a
-  // previous_response_id request is reconstituted into full history.
-  if (parsed.previous_response_id !== undefined && parsed.previous_response_id !== null) {
-    const prev = String(parsed.previous_response_id)
-    const history = sessions.get(prev)
-    if (!history) return errorResponse(400, `unknown previous_response_id ${prev} — not a subby-served response, or its session cache expired`)
-    const tail = Array.isArray(parsed.input) ? parsed.input : parsed.input == null ? [] : [{ type: "message", role: "user", content: String(parsed.input) }]
-    parsed.input = [...history, ...tail]
-    delete parsed.previous_response_id
-  }
+  const chainError = inlinePreviousResponse(parsed)
+  if (chainError) return errorResponse(400, chainError)
   parsed.store = false
-  // Rejected as "Unsupported parameter" by (at least some) Codex accounts;
-  // prompt_cache_key itself is supported and kept. Breakpoint markers on
-  // input items are likewise unsupported ("prompt_cache_breakpoint is not
-  // supported on this model").
-  delete parsed.prompt_cache_options
-  delete parsed.max_output_tokens
-  if (Array.isArray(parsed.input)) {
-    for (const item of parsed.input) {
-      if (!item || typeof item !== "object") continue
-      // The Codex backend rejects system-role items ("System messages are
-      // not allowed"); developer is its system-equivalent.
-      if ((item as Record<string, unknown>).role === "system") (item as Record<string, unknown>).role = "developer"
-      delete (item as Record<string, unknown>).prompt_cache_breakpoint
-      const content = (item as Record<string, unknown>).content
-      if (Array.isArray(content)) {
-        for (const part of content) {
-          if (part && typeof part === "object") delete (part as Record<string, unknown>).prompt_cache_breakpoint
-        }
-      }
-    }
-  }
-  // Whether the backend accepts non-SSE responses varies by account, so the
-  // only account-independent path is to ALWAYS stream upstream and aggregate
-  // the SSE into plain JSON for non-streaming clients.
+  normalizeForCodexBackend(parsed)
+  // The ChatGPT Codex backend only serves SSE ("Stream must be set to true"),
+  // so always stream upstream and aggregate for non-streaming clients.
   const clientStream = parsed.stream === true
   parsed.stream = true
   const body = JSON.stringify(parsed)
@@ -394,7 +440,9 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      return clientStream ? passthrough(res) : await aggregateResponse(res, parsed.input)
+      return clientStream
+        ? passthrough(res)
+        : await aggregateResponse(res, responseInputItems(parsed.input))
     }
 
     const text = await res.text()

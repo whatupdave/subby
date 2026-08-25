@@ -60,7 +60,7 @@ const upstream = Bun.serve({
         `data: ${JSON.stringify({ type: "response.completed", response })}`,
         "data: [DONE]",
       ]
-      return new Response(`${events.join("\n\n")}\n\n`, { headers: { "content-type": "text/event-stream" } })
+      return new Response(`${events.join("\r\n\r\n")}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response("not found", { status: 404 })
   },
@@ -168,42 +168,16 @@ describe("subby proxy", () => {
     expect(j.store).toBe(false)
   })
 
-  test("strips prompt_cache_options some codex accounts reject", async () => {
-    const res = await responses({ model: "gpt-5.4", input: "x", prompt_cache_key: "k", prompt_cache_options: { ttl: "1h" }, max_output_tokens: 64 })
-    expect(res.status).toBe(200)
-    expect(lastBody).not.toHaveProperty("prompt_cache_options")
-    expect(lastBody?.prompt_cache_key).toBe("k")
-    expect(lastBody).not.toHaveProperty("max_output_tokens")
-  })
-
-  test("strips prompt_cache_breakpoint markers from input items", async () => {
-    const res = await responses({
-      model: "gpt-5.4",
-      input: [
-        { role: "user", type: "message", content: "x", prompt_cache_breakpoint: { mode: "explicit" } },
-        { role: "system", type: "message", content: [{ type: "input_text", text: "y", prompt_cache_breakpoint: { mode: "explicit" } }] },
-      ],
-    })
-    expect(res.status).toBe(200)
-    const items = lastBody?.input as Record<string, unknown>[]
-    expect(items[0]).not.toHaveProperty("prompt_cache_breakpoint")
-    expect(items[0]?.content).toBe("x")
-    const parts = items[1]?.content as Record<string, unknown>[]
-    expect(parts[0]).not.toHaveProperty("prompt_cache_breakpoint")
-    expect(parts[0]?.text).toBe("y")
-    // system role rewritten to developer (backend rejects system)
-    expect(items[1]?.role).toBe("developer")
-  })
-
-  test("aggregates SSE into JSON for non-streaming clients", async () => {
+  test("aggregates SSE into JSON for explicit non-streaming clients", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
-    // upstream acceptance of non-SSE varies by account: always stream up
+    // the Codex backend only serves SSE, so upstream is always streamed
     expect(lastAccept).toBe("text/event-stream")
     expect(lastBody?.stream).toBe(true)
     const j = await json(res)
     expect(j.id).toBe("resp_1")
+    // output filled from response.output_item.done when completed.output is empty
     expect(j.output).toHaveLength(1)
   })
 
@@ -215,32 +189,12 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
-  test("emulates response chaining across stateless upstream", async () => {
-    const first = await responses({ model: "gpt-5.4", input: [{ role: "user", type: "message", content: "hi" }] })
-    expect((await json(first)).id).toBe("resp_1")
-    const second = await responses({
-      model: "gpt-5.4",
-      previous_response_id: "resp_1",
-      input: [{ type: "custom_tool_call_output", call_id: "call_1", output: "done" }],
-    })
-    expect(second.status).toBe(200)
-    const sent = lastBody?.input as Record<string, unknown>[]
-    // full history: original user item + replayable output item + the tail
-    expect(sent.map((i) => i.type ?? i.role)).toEqual(["message", "message", "custom_tool_call_output"])
-    expect(lastBody).not.toHaveProperty("previous_response_id")
-  })
-
-  test("unknown previous_response_id is a clear 400", async () => {
-    const res = await responses({ model: "gpt-5.4", previous_response_id: "resp_nope", input: [] })
-    expect(res.status).toBe(400)
-    expect(((await json(res)).error as { message: string }).message).toContain("unknown previous_response_id")
-  })
-
   test("defaults to aggregated non-streaming when stream is omitted", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x" })
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
     expect(lastAccept).toBe("text/event-stream")
+    expect(lastBody?.stream).toBe(true)
     expect((await json(res)).id).toBe("resp_1")
   })
 
@@ -314,10 +268,10 @@ describe("subby proxy", () => {
     expect(j2.error.message).toMatch(/used up/i)
   })
 
-  test("chaining to an unknown response id is rejected", async () => {
+  test("rejects chaining off a response it has never served", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", previous_response_id: "resp_previous" })
     expect(res.status).toBe(400)
-    expect(((await json(res)).error as { message: string }).message).toContain("unknown previous_response_id")
+    expect((await json(res)).error.message).toMatch(/unknown previous_response_id/i)
   })
 
   test("rejects browser-safelisted content types", async () => {
@@ -346,5 +300,62 @@ describe("subby proxy", () => {
   test("unknown route 404s", async () => {
     const res = await fetch(`${base}/v1/chat/completions`, { method: "POST", body: "{}" })
     expect(res.status).toBe(404)
+  })
+
+  test("normalizes regular-API requests for the codex backend", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const res = await responses({
+      model: "gpt-5.5",
+      prompt_cache_key: "k",
+      prompt_cache_retention: "24h",
+      prompt_cache_options: { mode: "explicit" },
+      max_output_tokens: 64,
+      input: [
+        {
+          role: "system",
+          type: "message",
+          prompt_cache_breakpoint: { mode: "explicit" },
+          content: [{ type: "input_text", text: "sys", prompt_cache_breakpoint: { mode: "explicit" } }],
+        },
+        { role: "user", content: [{ type: "input_text", text: "hi" }] },
+      ],
+    })
+    expect(res.status).toBe(200)
+    expect(lastBody?.prompt_cache_key).toBeUndefined()
+    expect(lastBody?.prompt_cache_retention).toBeUndefined()
+    expect(lastBody?.prompt_cache_options).toBeUndefined()
+    expect(lastBody?.max_output_tokens).toBeUndefined()
+    const input = lastBody?.input as Record<string, unknown>[]
+    expect(input[0]!.role).toBe("developer")
+    expect(input[0]!.prompt_cache_breakpoint).toBeUndefined()
+    const part = (input[0]!.content as Record<string, unknown>[])[0]!
+    expect(part.prompt_cache_breakpoint).toBeUndefined()
+    expect(input[1]!.role).toBe("user")
+  })
+
+  test("emulates previous_response_id chaining by inlining the cached transcript", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const first = await responses({ model: "gpt-5.4", input: "turn one" })
+    const firstId = (await json(first)).id
+    expect(firstId).toBe("resp_1")
+
+    const res = await responses({
+      model: "gpt-5.4",
+      previous_response_id: firstId,
+      input: [{ type: "function_call_output", call_id: "c1", output: "ok" }],
+    })
+    expect(res.status).toBe(200)
+    expect(lastBody?.previous_response_id).toBeUndefined()
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded).toHaveLength(3)
+    expect(forwarded[0]).toEqual({ role: "user", content: "turn one" })
+    expect(forwarded[1]!.type).toBe("message")
+    expect(forwarded[2]!.type).toBe("function_call_output")
+  })
+
+  test("rejects an unknown previous_response_id after the emulation cache is bypassed", async () => {
+    const res = await responses({ model: "gpt-5.4", previous_response_id: "resp_from_before_restart", input: "hi" })
+    expect(res.status).toBe(400)
+    expect((await json(res)).error.message).toMatch(/unknown previous_response_id/)
   })
 })
