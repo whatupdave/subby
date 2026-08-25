@@ -262,62 +262,79 @@ interface CompletedResponse {
 }
 
 interface ResponseStreamState {
-  completed?: CompletedResponse
-  failed?: unknown
-  items: unknown[]
+  terminal?: CompletedResponse
+  error?: unknown
+  items: Map<number, unknown>
+  nextItemIndex: number
 }
+
+const SSE_EVENT_SEPARATOR = /(?:\r\n|\r|\n){2}/
 
 function consumeSseEvent(chunk: string, state: ResponseStreamState): void {
   const payload = chunk
-    .split(/\r?\n/)
+    .split(/\r\n|\r|\n/)
     .filter((line) => line.startsWith("data:"))
     .map((line) => line.slice(5).trimStart())
     .join("\n")
     .trim()
   if (!payload || payload === "[DONE]") return
 
-  let event: { type?: string; response?: unknown; item?: unknown }
+  let event: { type?: string; response?: unknown; item?: unknown; output_index?: unknown }
   try {
     event = JSON.parse(payload)
   } catch {
     return
   }
-  if (event.type === "response.output_item.done" && event.item !== undefined) state.items.push(event.item)
-  if (event.type === "response.completed" && event.response && typeof event.response === "object") {
-    state.completed = event.response as CompletedResponse
+  if (event.type === "response.output_item.done" && event.item !== undefined) {
+    const index = typeof event.output_index === "number" && Number.isInteger(event.output_index) && event.output_index >= 0
+      ? event.output_index
+      : state.nextItemIndex
+    state.items.set(index, event.item)
+    state.nextItemIndex = Math.max(state.nextItemIndex, index + 1)
   }
-  if (event.type === "response.failed" || event.type === "error") state.failed = event
+  if (
+    (event.type === "response.completed" || event.type === "response.incomplete" || event.type === "response.failed") &&
+    event.response &&
+    typeof event.response === "object"
+  ) {
+    state.terminal = event.response as CompletedResponse
+  }
+  if (event.type === "error") state.error = event
 }
 
 async function aggregateResponse(upstream: Response, input: unknown[]): Promise<Response> {
   if (!upstream.body) return errorResponse(502, "upstream returned an empty response stream")
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
-  const state: ResponseStreamState = { items: [] }
+  const state: ResponseStreamState = { items: new Map(), nextItemIndex: 0 }
   let buffer = ""
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    buffer += decoder.decode(value, { stream: true })
-    let separator = /\r?\n\r?\n/.exec(buffer)
-    while (separator?.index !== undefined) {
-      consumeSseEvent(buffer.slice(0, separator.index), state)
-      buffer = buffer.slice(separator.index + separator[0].length)
-      separator = /\r?\n\r?\n/.exec(buffer)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let separator = SSE_EVENT_SEPARATOR.exec(buffer)
+      while (separator?.index !== undefined) {
+        consumeSseEvent(buffer.slice(0, separator.index), state)
+        buffer = buffer.slice(separator.index + separator[0].length)
+        separator = SSE_EVENT_SEPARATOR.exec(buffer)
+      }
     }
+    buffer += decoder.decode()
+    if (buffer.trim()) consumeSseEvent(buffer, state)
+  } catch (error) {
+    return errorResponse(502, `upstream response stream failed: ${error instanceof Error ? error.message : String(error)}`)
   }
-  buffer += decoder.decode()
-  if (buffer.trim()) consumeSseEvent(buffer, state)
 
-  const completed = state.completed
-  if (!completed) {
-    const detail = state.failed ? `: ${JSON.stringify(state.failed).slice(0, 300)}` : ""
-    return errorResponse(502, `upstream stream ended without response.completed${detail}`)
+  const terminal = state.terminal
+  if (!terminal) {
+    const detail = state.error ? `: ${JSON.stringify(state.error).slice(0, 300)}` : ""
+    return errorResponse(502, `upstream stream ended without a terminal response event${detail}`)
   }
-  if (!completed.output?.length) completed.output = state.items
-  rememberResponse(completed, input)
-  return Response.json(completed)
+  if (!terminal.output?.length) terminal.output = [...state.items.entries()].sort(([a], [b]) => a - b).map(([, item]) => item)
+  rememberResponse(terminal, input)
+  return Response.json(terminal)
 }
 
 interface CachedResponse {
@@ -340,10 +357,7 @@ function responseInputItems(input: unknown): unknown[] {
 
 function rememberResponse(completed: CompletedResponse, input: unknown[]): void {
   if (typeof completed.id !== "string" || !Array.isArray(completed.output)) return
-  // Reasoning items cannot be replayed without encrypted content.
-  const output = completed.output.filter(
-    (item) => !(item && typeof item === "object" && (item as { type?: unknown }).type === "reasoning"),
-  )
+  const output = completed.output
   const bytes = Buffer.byteLength(JSON.stringify([input, output]))
   if (bytes > RESPONSE_CACHE_MAX_BYTES) return
 

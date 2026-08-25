@@ -54,13 +54,34 @@ const upstream = Bun.serve({
         return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
       }
       if (!body.stream) return Response.json({ detail: "Stream must be set to true" }, { status: 400 })
-      const response = { id: "resp_1", account: acct, store: body.store, model: body.model, output: [] }
-      const events = [
-        `data: ${JSON.stringify({ type: "response.output_item.done", item: { type: "message", account: acct } })}`,
-        `data: ${JSON.stringify({ type: "response.completed", response })}`,
-        "data: [DONE]",
-      ]
-      return new Response(`${events.join("\r\n\r\n")}\r\n\r\n`, { headers: { "content-type": "text/event-stream" } })
+      const status = body.model === "test-incomplete" ? "incomplete" : body.model === "test-failed" ? "failed" : "completed"
+      const response = {
+        id: "resp_1",
+        account: acct,
+        store: body.store,
+        model: body.model,
+        status,
+        output: [],
+        error: status === "failed" ? { code: "server_error", message: "generation failed" } : null,
+        incomplete_details: status === "incomplete" ? { reason: "max_output_tokens" } : null,
+      }
+      const outputItems = body.model === "test-reversed"
+        ? [
+            { output_index: 1, item: { type: "message", content: "second" } },
+            { output_index: 0, item: { type: "message", content: "first" } },
+          ]
+        : body.model === "test-reasoning"
+          ? [
+              { output_index: 0, item: { type: "reasoning", encrypted_content: "encrypted" } },
+              { output_index: 1, item: { type: "function_call", call_id: "c1", name: "lookup", arguments: "{}" } },
+            ]
+          : [{ output_index: 0, item: { type: "message", account: acct } }]
+      const events = status === "failed"
+        ? []
+        : outputItems.map(({ output_index, item }) => `data: ${JSON.stringify({ type: "response.output_item.done", output_index, item })}`)
+      events.push(`data: ${JSON.stringify({ type: `response.${status}`, response })}`, "data: [DONE]")
+      const separator = body.model === "test-cr-framing" ? "\r\r" : "\r\n\r\n"
+      return new Response(`${events.join(separator)}${separator}`, { headers: { "content-type": "text/event-stream" } })
     }
     return new Response("not found", { status: 404 })
   },
@@ -177,6 +198,26 @@ describe("subby proxy", () => {
     const j = await json(res)
     expect(j.id).toBe("resp_1")
     expect(j.output).toHaveLength(1)
+  })
+
+  test("preserves incomplete and failed terminal responses", async () => {
+    for (const [model, status] of [["test-incomplete", "incomplete"], ["test-failed", "failed"]]) {
+      const res = await responses({ model, input: "x" })
+      expect(res.status).toBe(200)
+      expect((await json(res)).status).toBe(status)
+    }
+  })
+
+  test("orders aggregated output by output_index", async () => {
+    const res = await responses({ model: "test-reversed", input: "x" })
+    const output = (await json(res)).output as { content: string }[]
+    expect(output.map((item) => item.content)).toEqual(["first", "second"])
+  })
+
+  test("accepts CR-only SSE framing", async () => {
+    const res = await responses({ model: "test-cr-framing", input: "x" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).status).toBe("completed")
   })
 
   test("passes through streaming responses", async () => {
@@ -351,4 +392,23 @@ describe("subby proxy", () => {
     expect(forwarded[2]!.type).toBe("function_call_output")
   })
 
+  test("replays encrypted reasoning items when chaining", async () => {
+    const first = await responses({
+      model: "test-reasoning",
+      input: "investigate",
+      include: ["reasoning.encrypted_content"],
+    })
+    const firstId = (await json(first)).id
+
+    const res = await responses({
+      model: "test-reasoning",
+      previous_response_id: firstId,
+      input: [{ type: "function_call_output", call_id: "c1", output: "result" }],
+    })
+    expect(res.status).toBe(200)
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded[1]).toEqual({ type: "reasoning", encrypted_content: "encrypted" })
+    expect(forwarded[2]!.type).toBe("function_call")
+    expect(forwarded[3]!.type).toBe("function_call_output")
+  })
 })
