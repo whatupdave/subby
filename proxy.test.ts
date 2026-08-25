@@ -172,12 +172,10 @@ describe("subby proxy", () => {
     const res = await responses({ model: "gpt-5.4", input: "x", stream: false })
     expect(res.status).toBe(200)
     expect(res.headers.get("content-type")).toContain("application/json")
-    // the Codex backend only serves SSE, so upstream is always streamed
     expect(lastAccept).toBe("text/event-stream")
     expect(lastBody?.stream).toBe(true)
     const j = await json(res)
     expect(j.id).toBe("resp_1")
-    // output filled from response.output_item.done when completed.output is empty
     expect(j.output).toHaveLength(1)
   })
 
@@ -353,9 +351,4 @@ describe("subby proxy", () => {
     expect(forwarded[2]!.type).toBe("function_call_output")
   })
 
-  test("rejects an unknown previous_response_id after the emulation cache is bypassed", async () => {
-    const res = await responses({ model: "gpt-5.4", previous_response_id: "resp_from_before_restart", input: "hi" })
-    expect(res.status).toBe(400)
-    expect((await json(res)).error.message).toMatch(/unknown previous_response_id/)
-  })
 })

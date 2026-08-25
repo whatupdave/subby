@@ -219,7 +219,7 @@ function abortable<T>(start: () => Promise<T>, signal: AbortSignal): Promise<T> 
   })
 }
 
-function forward(sub: Sub, body: string, stream: boolean, signal: AbortSignal): Promise<Response> {
+function forward(sub: Sub, body: string, signal: AbortSignal): Promise<Response> {
   return abortable(
     () => withAuthRetry(sub, (accessToken) => {
       const sessionId = crypto.randomUUID()
@@ -229,7 +229,7 @@ function forward(sub: Sub, body: string, stream: boolean, signal: AbortSignal): 
           authorization: `Bearer ${accessToken}`,
           "chatgpt-account-id": sub.tokens.accountId ?? "",
           "content-type": "application/json",
-          accept: stream ? "text/event-stream" : "application/json",
+          accept: "text/event-stream",
           "openai-beta": "responses=experimental",
           originator: "subby",
           "user-agent": "subby",
@@ -425,7 +425,7 @@ async function handleResponses(req: Request): Promise<Response> {
     const sub = await pickSub(req.signal)
     let res: Response
     try {
-      res = await forward(sub, body, true, req.signal)
+      res = await forward(sub, body, req.signal)
     } catch (e) {
       state.lastError = e instanceof Error ? e.message : String(e)
       if (e instanceof AccountAuthError) {
@@ -440,9 +440,7 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      return clientStream
-        ? passthrough(res)
-        : await aggregateResponse(res, responseInputItems(parsed.input))
+      return clientStream ? passthrough(res) : await aggregateResponse(res, responseInputItems(parsed.input))
     }
 
     const text = await res.text()
