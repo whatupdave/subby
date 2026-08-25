@@ -190,6 +190,8 @@ describe("subby proxy", () => {
     const parts = items[1]?.content as Record<string, unknown>[]
     expect(parts[0]).not.toHaveProperty("prompt_cache_breakpoint")
     expect(parts[0]?.text).toBe("y")
+    // system role rewritten to developer (backend rejects system)
+    expect(items[1]?.role).toBe("developer")
   })
 
   test("aggregates SSE into JSON for non-streaming clients", async () => {

@@ -325,6 +325,9 @@ async function handleResponses(req: Request): Promise<Response> {
   if (Array.isArray(parsed.input)) {
     for (const item of parsed.input) {
       if (!item || typeof item !== "object") continue
+      // The Codex backend rejects system-role items ("System messages are
+      // not allowed"); developer is its system-equivalent.
+      if ((item as Record<string, unknown>).role === "system") (item as Record<string, unknown>).role = "developer"
       delete (item as Record<string, unknown>).prompt_cache_breakpoint
       const content = (item as Record<string, unknown>).content
       if (Array.isArray(content)) {
