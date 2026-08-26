@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import { useBlur, useFocus, useKeyboard, useRenderer } from "@opentui/react"
 import { loadShowEmails, loadSubs, saveShowEmails, saveSubs } from "./store.ts"
+import { mergeAuthenticatedSub } from "./subs.ts"
 import * as claude from "./claude.ts"
 import * as codex from "./codex.ts"
 import * as proxy from "./proxy.ts"
@@ -13,6 +14,11 @@ const DIM = "#666666"
 
 function bar(pct: number): string {
   const filled = Math.round(Math.max(0, Math.min(100, pct)) / 5)
+  return "█".repeat(filled) + "░".repeat(20 - filled)
+}
+
+function streamBar(openStreams: number): string {
+  const filled = Math.min(20, openStreams)
   return "█".repeat(filled) + "░".repeat(20 - filled)
 }
 
@@ -75,6 +81,45 @@ function SubCard({ sub, usage, selected, index, showEmails, onClick }: { sub: Su
   )
 }
 
+function ProxyCard({ info, subs, showEmails }: { info: proxy.ProxyInfo; subs: Sub[]; showEmails: boolean }) {
+  const currentIndex = subs.findIndex((sub) => sub.id === info.currentId)
+  const currentSub = currentIndex >= 0 ? subs[currentIndex] : undefined
+  const currentLabel = !info.running
+    ? "—"
+    : !info.currentId
+      ? "waiting for a request…"
+      : showEmails
+        ? currentSub?.label ?? "unknown"
+        : currentSub
+          ? `[#${currentIndex + 1}]`
+          : "[unknown]"
+  const streamColor = info.rateLimited ? "#ff5f5f" : info.running ? "#87d787" : DIM
+
+  return (
+    <box
+      border
+      borderStyle="rounded"
+      title=" proxy "
+      style={{ flexDirection: "column", borderColor: info.rateLimited ? "#ff5f5f" : "#3a3a3a", paddingLeft: 1, paddingRight: 1, marginBottom: 1 }}
+    >
+      <text>
+        <span fg={DIM}>  status   </span>
+        <span fg={info.running ? "#87d787" : DIM}>{info.running ? "● running" : "○ stopped"}</span>
+        <span fg={DIM}>{info.running ? ` · ${info.requests} requests` : ""}</span>
+      </text>
+      <text><span fg={DIM}>  endpoint </span>{info.url ?? "—"}</text>
+      <text><span fg={DIM}>  sub      </span>{currentLabel}</text>
+      <text>
+        <span fg={DIM}>  streams  </span>
+        <span fg={streamColor}>{streamBar(info.openStreams)}</span>
+        <span> {info.openStreams} open</span>
+        {info.rateLimited ? <span fg="#ff5f5f"> · rate limited ({info.rateLimits})</span> : null}
+      </text>
+      {info.lastError && info.lastError !== "upstream 429" ? <text fg="#ffaf5f">  {info.lastError}</text> : null}
+    </box>
+  )
+}
+
 type Mode = "list" | "pick" | "adding" | "confirm-remove"
 
 export function App() {
@@ -89,6 +134,7 @@ export function App() {
   const cancelLogin = useRef<(() => void) | null>(null)
   const focused = useRef(true)
   const subsRef = useRef(subs)
+  const pollVersion = useRef(0)
 
   useEffect(() => {
     proxy.setSubSource(() => subsRef.current)
@@ -134,9 +180,11 @@ export function App() {
   })
 
   async function poll(list: Sub[]) {
+    const version = ++pollVersion.current
     const entries = await Promise.all(
       list.map(async (s) => [s.id, await providers[s.provider].fetchUsage(s).catch((e) => ({ error: String(e?.message ?? e) }))] as const),
     )
+    if (version !== pollVersion.current) return
     setUsages((prev) =>
       Object.fromEntries(
         entries.map(([id, usage]) => {
@@ -145,7 +193,7 @@ export function App() {
         }),
       ),
     )
-    saveSubs(list) // refresh() rotates tokens in place
+    saveSubs(subsRef.current) // refresh() rotates tokens in place
   }
 
   useEffect(() => {
@@ -171,12 +219,13 @@ export function App() {
     setStatus(`waiting for ${provider} login in browser…`)
     promise
       .then((sub) => {
-        setStatus("added")
-        setSubs((prev) => {
-          const next = [...prev, sub]
-          saveSubs(next)
-          return next
-        })
+        const result = mergeAuthenticatedSub(subsRef.current, sub)
+        pollVersion.current++
+        saveSubs(result.subs)
+        subsRef.current = result.subs
+        if (result.replaced) proxy.credentialsUpdated(result.id)
+        setSubs(result.subs)
+        setStatus(result.replaced ? "reauthenticated" : "added")
         setMode("list")
       })
       .catch((e) => {
@@ -187,7 +236,9 @@ export function App() {
 
   function removeSelected() {
     const next = subs.filter((_, i) => i !== sel)
+    pollVersion.current++
     saveSubs(next)
+    subsRef.current = next
     setSubs(next)
     setSel((s) => Math.max(0, Math.min(s, next.length - 1)))
     setStatus("removed")
@@ -250,6 +301,7 @@ export function App() {
         <span fg={DIM}> — claude & codex subscription usage</span>
       </text>
       <scrollbox style={{ flexGrow: 1, marginTop: 1 }}>
+        <ProxyCard info={proxyInfo} subs={subs} showEmails={showEmails} />
         {subs.map((sub, i) => (
           <SubCard key={sub.id} sub={sub} usage={usages[sub.id]} selected={i === sel && mode === "list"} index={i + 1} showEmails={showEmails} onClick={() => setSel(i)} />
         ))}
@@ -285,10 +337,7 @@ export function App() {
           <span fg="#ffaf5f">{status} (esc to cancel)</span>
         ) : (
           <span fg={DIM}>
-            [a] add · [r] refresh · [d] remove · [p] proxy {proxyInfo.url ?? "off"}
-            {proxyInfo.running
-              ? ` → ${showEmails ? subs.find((s) => s.id === proxyInfo.currentId)?.label ?? "—" : proxyInfo.currentId ? `#${subs.findIndex((s) => s.id === proxyInfo.currentId) + 1 || "?"}` : "—"}`
-              : ""}
+            [a] add · [r] refresh · [d] remove · [p] {proxyInfo.running ? "stop" : "start"} proxy
             {" · [e] "}
             {showEmails ? "hide" : "show"}
             {" emails · [↑↓] select · [q] quit"}
