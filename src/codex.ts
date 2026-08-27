@@ -127,6 +127,5 @@ export async function fetchUsage(sub: Sub, signal = AbortSignal.timeout(10_000))
     if (w.limit_window_seconds <= 100_000) usage.session = win
     else usage.weekly = win
   }
-  if (j.email) usage.plan = `${j.plan_type} · ${j.email}`
   return usage
 }

@@ -48,16 +48,38 @@ function UsageRow({ name, win }: { name: string; win?: UsageWindow }) {
   )
 }
 
-function SubCard({ sub, usage, selected, index, showEmails, onClick }: { sub: Sub; usage?: Usage; selected: boolean; index: number; showEmails: boolean; onClick: () => void }) {
+function ProxyDetails({ info, merged = false }: { info: proxy.ProxyInfo; merged?: boolean }) {
+  const streamColor = info.rateLimited ? "#ff5f5f" : info.running ? "#87d787" : DIM
+
+  return (
+    <box style={{ flexDirection: "column", marginTop: merged ? 1 : 0 }}>
+      <text>
+        <span fg={DIM}>{merged ? "  proxy    " : "  status   "}</span>
+        <span fg={info.running ? "#87d787" : DIM}>{info.running ? "● running" : "○ stopped"}</span>
+        <span fg={DIM}>{info.running ? ` · ${info.requests} requests` : ""}</span>
+      </text>
+      <text><span fg={DIM}>  endpoint </span>{info.url ?? "—"}</text>
+      <text>
+        <span fg={DIM}>  streams  </span>
+        <span fg={streamColor}>{streamBar(info.openStreams)}</span>
+        <span> {info.openStreams} open</span>
+        {info.rateLimited ? <span fg="#ff5f5f"> · rate limited ({info.rateLimits})</span> : null}
+      </text>
+      {info.lastError && info.lastError !== "upstream 429" ? <text fg="#ffaf5f">  {info.lastError}</text> : null}
+    </box>
+  )
+}
+
+function SubCard({ sub, usage, proxyInfo, selected, index, showEmails, onClick }: { sub: Sub; usage?: Usage; proxyInfo?: proxy.ProxyInfo; selected: boolean; index: number; showEmails: boolean; onClick: () => void }) {
   const title = showEmails ? sub.label : `[${index}]`
   const plan = showEmails ? usage?.plan : usage?.plan?.split(" · ")[0]
   return (
     <box
       border
       borderStyle="rounded"
-      title={` ${title} `}
+      title={` ${proxyInfo ? "proxy · " : ""}${title} `}
       onMouseDown={onClick}
-      style={{ flexDirection: "column", borderColor: selected ? ACCENT : "#3a3a3a", paddingLeft: 1, paddingRight: 1, marginBottom: 0 }}
+      style={{ flexDirection: "column", borderColor: proxyInfo?.rateLimited ? "#ff5f5f" : selected ? ACCENT : "#3a3a3a", paddingLeft: 1, paddingRight: 1, marginBottom: 0 }}
     >
       <text fg={PROVIDER_COLOR[sub.provider]}>
         {sub.provider}
@@ -77,6 +99,7 @@ function SubCard({ sub, usage, selected, index, showEmails, onClick }: { sub: Su
       ) : (
         <text fg={DIM}>  loading…</text>
       )}
+      {proxyInfo ? <ProxyDetails info={proxyInfo} merged /> : null}
     </box>
   )
 }
@@ -93,8 +116,6 @@ function ProxyCard({ info, subs, showEmails }: { info: proxy.ProxyInfo; subs: Su
         : currentSub
           ? `[#${currentIndex + 1}]`
           : "[unknown]"
-  const streamColor = info.rateLimited ? "#ff5f5f" : info.running ? "#87d787" : DIM
-
   return (
     <box
       border
@@ -102,20 +123,8 @@ function ProxyCard({ info, subs, showEmails }: { info: proxy.ProxyInfo; subs: Su
       title=" proxy "
       style={{ flexDirection: "column", borderColor: info.rateLimited ? "#ff5f5f" : "#3a3a3a", paddingLeft: 1, paddingRight: 1, marginBottom: 1 }}
     >
-      <text>
-        <span fg={DIM}>  status   </span>
-        <span fg={info.running ? "#87d787" : DIM}>{info.running ? "● running" : "○ stopped"}</span>
-        <span fg={DIM}>{info.running ? ` · ${info.requests} requests` : ""}</span>
-      </text>
-      <text><span fg={DIM}>  endpoint </span>{info.url ?? "—"}</text>
+      <ProxyDetails info={info} />
       <text><span fg={DIM}>  sub      </span>{currentLabel}</text>
-      <text>
-        <span fg={DIM}>  streams  </span>
-        <span fg={streamColor}>{streamBar(info.openStreams)}</span>
-        <span> {info.openStreams} open</span>
-        {info.rateLimited ? <span fg="#ff5f5f"> · rate limited ({info.rateLimits})</span> : null}
-      </text>
-      {info.lastError && info.lastError !== "upstream 429" ? <text fg="#ffaf5f">  {info.lastError}</text> : null}
     </box>
   )
 }
@@ -135,6 +144,16 @@ export function App() {
   const focused = useRef(true)
   const subsRef = useRef(subs)
   const pollVersion = useRef(0)
+  const proxiedSubIndex = subs.findIndex((sub) => sub.id === proxyInfo.currentId)
+  // Before the first request chooses an account, keep the proxy merged into an
+  // eligible Codex card rather than showing a separate waiting card.
+  const proxyCardSubIndex = proxiedSubIndex >= 0
+    ? proxiedSubIndex
+    : subs.findIndex((sub) => sub.provider === "codex")
+  const displayedSubs = proxyCardSubIndex > 0
+    ? [subs[proxyCardSubIndex]!, ...subs.slice(0, proxyCardSubIndex), ...subs.slice(proxyCardSubIndex + 1)]
+    : subs
+  const selectedDisplayIndex = displayedSubs.findIndex((sub) => sub.id === subs[sel]?.id)
 
   useEffect(() => {
     proxy.setSubSource(() => subsRef.current)
@@ -244,6 +263,14 @@ export function App() {
     setStatus("removed")
   }
 
+  function moveSelection(offset: number) {
+    if (!displayedSubs.length) return
+    const current = selectedDisplayIndex >= 0 ? selectedDisplayIndex : 0
+    const next = Math.max(0, Math.min(current + offset, displayedSubs.length - 1))
+    const nextId = displayedSubs[next]!.id
+    setSel(subs.findIndex((sub) => sub.id === nextId))
+  }
+
   useKeyboard((key) => {
     if (key.name === "q" || (key.ctrl && key.name === "c")) {
       renderer.destroy()
@@ -285,11 +312,11 @@ export function App() {
         break
       case "up":
       case "k":
-        setSel((s) => Math.max(0, s - 1))
+        moveSelection(-1)
         break
       case "down":
       case "j":
-        setSel((s) => Math.min(subs.length - 1, s + 1))
+        moveSelection(1)
         break
     }
   })
@@ -301,10 +328,22 @@ export function App() {
         <span fg={DIM}> — claude & codex subscription usage</span>
       </text>
       <scrollbox style={{ flexGrow: 1, marginTop: 1 }}>
-        <ProxyCard info={proxyInfo} subs={subs} showEmails={showEmails} />
-        {subs.map((sub, i) => (
-          <SubCard key={sub.id} sub={sub} usage={usages[sub.id]} selected={i === sel && mode === "list"} index={i + 1} showEmails={showEmails} onClick={() => setSel(i)} />
-        ))}
+        {proxyCardSubIndex < 0 ? <ProxyCard info={proxyInfo} subs={subs} showEmails={showEmails} /> : null}
+        {displayedSubs.map((sub, i) => {
+          const subIndex = subs.findIndex((candidate) => candidate.id === sub.id)
+          return (
+            <SubCard
+              key={sub.id}
+              sub={sub}
+              usage={usages[sub.id]}
+              proxyInfo={subIndex === proxyCardSubIndex ? proxyInfo : undefined}
+              selected={subIndex === sel && mode === "list"}
+              index={i + 1}
+              showEmails={showEmails}
+              onClick={() => setSel(subIndex)}
+            />
+          )
+        })}
         {subs.length === 0 && <text fg={DIM}>no subs yet — press [a] or click the button below</text>}
         <box
           border
@@ -332,7 +371,7 @@ export function App() {
 
       <text>
         {mode === "confirm-remove" ? (
-          <span fg="#ffaf5f">remove {showEmails ? subs[sel]?.label : `[${sel + 1}]`}? [y/n]</span>
+          <span fg="#ffaf5f">remove {showEmails ? subs[sel]?.label : `[${selectedDisplayIndex + 1}]`}? [y/n]</span>
         ) : mode === "adding" ? (
           <span fg="#ffaf5f">{status} (esc to cancel)</span>
         ) : (
