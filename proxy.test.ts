@@ -51,9 +51,11 @@ const upstream = Bun.serve({
       if (acct === "A") return Response.json({ error: { message: "Monthly usage limit reached (GoUsageLimitError)" } }, { status: 429 })
       if (acct === "B" && body.fail) return Response.json({ error: { message: "Monthly usage limit reached" } }, { status: 429 })
       if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
+        if (body.delayAuth) await Bun.sleep(50)
         return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
       }
       if (!body.stream) return Response.json({ detail: "Stream must be set to true" }, { status: 400 })
+      if (body.model === "test-rate-limit") return Response.json({ error: { message: "Too many concurrent requests" } }, { status: 429 })
       const status = body.model === "test-incomplete" ? "incomplete" : body.model === "test-failed" ? "failed" : "completed"
       const response = {
         id: "resp_1",
@@ -83,6 +85,18 @@ const upstream = Bun.serve({
       events.push(`data: ${JSON.stringify({ type: `response.${status}`, response })}`, "data: [DONE]")
       const separator = body.model === "test-cr-framing" ? "\r\r" : "\r\n\r\n"
       const payload = `${events.join(separator)}${separator}`
+      if (body.model === "test-delayed-stream") {
+        return new Response(new ReadableStream({
+          start(controller) {
+            const encoder = new TextEncoder()
+            controller.enqueue(encoder.encode(": stream opened\n\n"))
+            setTimeout(() => {
+              controller.enqueue(encoder.encode(payload))
+              controller.close()
+            }, 50)
+          },
+        }), { headers: { "content-type": "text/event-stream" } })
+      }
       if (body.model === "test-terminal-open") {
         return new Response(new ReadableStream({
           start(controller) {
@@ -243,6 +257,28 @@ describe("subby proxy", () => {
     expect(await res.text()).toContain("data: [DONE]")
   })
 
+  test("reports concurrent response streams until they close", async () => {
+    const streams = await Promise.all([
+      responses({ model: "test-delayed-stream", input: "one", stream: true }),
+      responses({ model: "test-delayed-stream", input: "two", stream: true }),
+    ])
+    expect(streams.every((res) => res.status === 200)).toBe(true)
+    expect(proxy.info().openStreams).toBe(2)
+
+    const bodies = await Promise.all(streams.map((res) => res.text()))
+    expect(bodies.every((body) => body.includes("data: [DONE]"))).toBe(true)
+    expect(proxy.info().openStreams).toBe(0)
+  })
+
+  test("reports transient upstream rate limits", async () => {
+    const before = proxy.info().rateLimits
+    const res = await responses({ model: "test-rate-limit", input: "x" })
+    expect(res.status).toBe(429)
+    expect(proxy.info().rateLimits).toBe(before + 1)
+    expect(proxy.info().rateLimited).toBe(true)
+    expect(proxy.info().lastRateLimitAt).toBeNumber()
+  })
+
   test("defaults to aggregated non-streaming when stream is omitted", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x" })
     expect(res.status).toBe(200)
@@ -308,6 +344,24 @@ describe("subby proxy", () => {
     expect(res.status).toBe(200)
     expect((await json(res)).account).toBe("G")
     expect(hits).toEqual(["F", "F", "G"])
+  })
+
+  test("does not requarantine an account when old credentials fail after reauthentication", async () => {
+    const rejected = makeSub("F")
+    proxy.credentialsUpdated(rejected.id)
+    proxy.setSubSource(() => [rejected])
+    const oldRequest = responses({ model: "gpt-5.4", input: "reject old credentials", delayAuth: true })
+    await Bun.sleep(10)
+
+    const reauthenticated = makeSub("C")
+    reauthenticated.id = rejected.id
+    proxy.setSubSource(() => [reauthenticated])
+    proxy.credentialsUpdated(reauthenticated.id)
+    expect((await oldRequest).status).toBe(503)
+
+    const res = await responses({ model: "gpt-5.4", input: "use new credentials" })
+    expect(res.status).toBe(200)
+    expect((await json(res)).account).toBe("C")
   })
 
   test("fails over when the sticky sub is used up", async () => {

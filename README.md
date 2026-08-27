@@ -9,7 +9,7 @@ bun install
 bun run start
 ```
 
-The proxy starts with the TUI; press **`p`** to stop or restart it. Add Codex subscriptions with **`a`**.
+The proxy starts with the TUI; press **`p`** to stop or restart it. Add subscriptions with **`a`**. Signing in to an account that already exists refreshes its stored credentials instead of creating a duplicate.
 
 Its OpenAI-compatible base URL is shown in the TUI. By default it listens only on:
 

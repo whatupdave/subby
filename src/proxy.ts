@@ -48,6 +48,9 @@ interface ProxyState {
   currentId: string | null
   exhausted: Map<string, number>
   requests: number
+  openStreams: Set<symbol>
+  rateLimits: number
+  lastRateLimitAt: number | null
   lastError: string | null
 }
 
@@ -58,6 +61,9 @@ const state: ProxyState = {
   currentId: null,
   exhausted: new Map<string, number>(),
   requests: 0,
+  openStreams: new Set(),
+  rateLimits: 0,
+  lastRateLimitAt: null,
   lastError: null,
 }
 
@@ -77,7 +83,23 @@ export function isRunning(): boolean {
   return state.server !== null
 }
 
-export function info(): { running: boolean; host: string; port: number; url: string | null; currentId: string | null; requests: number; lastError: string | null } {
+const RATE_LIMIT_WARNING_MS = 60_000
+
+export interface ProxyInfo {
+  running: boolean
+  host: string
+  port: number
+  url: string | null
+  currentId: string | null
+  requests: number
+  openStreams: number
+  rateLimits: number
+  lastRateLimitAt: number | null
+  rateLimited: boolean
+  lastError: string | null
+}
+
+export function info(): ProxyInfo {
   const running = isRunning()
   const host = state.host.includes(":") && !state.host.startsWith("[") ? `[${state.host}]` : state.host
   return {
@@ -87,26 +109,44 @@ export function info(): { running: boolean; host: string; port: number; url: str
     url: running ? `http://${host}:${state.port}/v1` : null,
     currentId: state.currentId,
     requests: state.requests,
+    openStreams: state.openStreams.size,
+    rateLimits: state.rateLimits,
+    lastRateLimitAt: state.lastRateLimitAt,
+    rateLimited: state.lastRateLimitAt !== null && Date.now() - state.lastRateLimitAt < RATE_LIMIT_WARNING_MS,
     lastError: state.lastError,
   }
 }
 
 const usageCache = new Map<string, { at: number; usage: Usage }>()
 const pendingTokenSaves = new Set<string>()
+const credentialGenerations = new Map<string, number>()
 
-function saveRefreshedToken(sub: Sub, previousAccessToken: string): void {
+function credentialGeneration(id: string): number {
+  return credentialGenerations.get(id) ?? 0
+}
+
+export function credentialsUpdated(id: string): void {
+  credentialGenerations.set(id, credentialGeneration(id) + 1)
+  state.exhausted.delete(id)
+  usageCache.delete(id)
+  pendingTokenSaves.delete(id)
+}
+
+function saveRefreshedToken(sub: Sub, previousAccessToken: string, generation: number): void {
+  if (generation !== credentialGeneration(sub.id)) return
   if (sub.tokens.access !== previousAccessToken) pendingTokenSaves.add(sub.id)
   if (!pendingTokenSaves.has(sub.id)) return
   persistSubs(getSubs())
   pendingTokenSaves.delete(sub.id)
 }
 
-async function usageOf(sub: Sub, force: boolean, signal: AbortSignal): Promise<Usage> {
+async function usageOf(sub: Sub, force: boolean, signal: AbortSignal, generation = credentialGeneration(sub.id)): Promise<Usage> {
   const cached = usageCache.get(sub.id)
   if (!force && cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) return cached.usage
   const before = sub.tokens.access
   const usage = await fetchUsage(sub, signal).catch((e) => ({ error: String(e?.message ?? e) }) as Usage)
-  saveRefreshedToken(sub, before)
+  if (generation !== credentialGeneration(sub.id)) return usage
+  saveRefreshedToken(sub, before, generation)
   usageCache.set(sub.id, { at: Date.now(), usage })
   return usage
 }
@@ -116,7 +156,8 @@ function effectivePct(u: Usage): number {
   return Math.max(u.session?.pct ?? 0, u.weekly?.pct ?? 0)
 }
 
-function exhaust(sub: Sub, usage: Usage | undefined): void {
+function exhaust(sub: Sub, usage: Usage | undefined, generation: number): void {
+  if (generation !== credentialGeneration(sub.id)) return
   const now = Date.now()
   const windows = [usage?.session, usage?.weekly].filter((w) => w?.resetsAt && w.resetsAt > now)
   const fullResets = windows.filter((w) => w!.pct >= 100).map((w) => w!.resetsAt!)
@@ -156,13 +197,15 @@ async function pickSub(signal: AbortSignal): Promise<Sub> {
   const usageSignal = AbortSignal.any([signal, AbortSignal.timeout(usageTimeoutMs())])
   const scored = await Promise.all(
     available.map(async (sub) => {
-      const usage = await usageOf(sub, false, usageSignal)
-      return { sub, usage, pct: effectivePct(usage) }
+      const generation = credentialGeneration(sub.id)
+      const usage = await usageOf(sub, false, usageSignal, generation)
+      return { sub, usage, pct: effectivePct(usage), generation }
     }),
   )
   if (signal.aborted) throw signal.reason
-  for (const { sub, usage, pct } of scored) {
-    if (pct >= 100 && !usage.error) exhaust(sub, usage)
+  if (scored.some(({ sub, generation }) => generation !== credentialGeneration(sub.id))) return pickSub(signal)
+  for (const { sub, usage, pct, generation } of scored) {
+    if (pct >= 100 && !usage.error) exhaust(sub, usage, generation)
   }
   const usable = scored.filter(({ sub }) => !state.exhausted.has(sub.id))
   if (!usable.length) throw new ApiError(429, "all codex subs are used up")
@@ -171,7 +214,7 @@ async function pickSub(signal: AbortSignal): Promise<Sub> {
   return best.sub
 }
 
-async function withAccessToken(sub: Sub, forceFresh: boolean, request: (accessToken: string) => Promise<Response>) {
+async function withAccessToken(sub: Sub, forceFresh: boolean, request: (accessToken: string) => Promise<Response>, generation: number) {
   const before = sub.tokens.access
   try {
     await ensureFreshToken(sub, forceFresh)
@@ -179,19 +222,19 @@ async function withAccessToken(sub: Sub, forceFresh: boolean, request: (accessTo
     const message = e instanceof Error ? e.message : String(e)
     throw new AccountAuthError(message, e instanceof TokenRefreshError && e.permanent)
   }
-  saveRefreshedToken(sub, before)
+  saveRefreshedToken(sub, before, generation)
 
   const accessToken = sub.tokens.access
   return { response: await request(accessToken), accessToken }
 }
 
-async function withAuthRetry(sub: Sub, request: (accessToken: string) => Promise<Response>): Promise<Response> {
-  const first = await withAccessToken(sub, false, request)
+async function withAuthRetry(sub: Sub, request: (accessToken: string) => Promise<Response>, generation = credentialGeneration(sub.id)): Promise<Response> {
+  const first = await withAccessToken(sub, false, request, generation)
   if (first.response.status !== 401) return first.response
   await first.response.text()
 
   const forceRefresh = sub.tokens.access === first.accessToken
-  const retry = await withAccessToken(sub, forceRefresh, request)
+  const retry = await withAccessToken(sub, forceRefresh, request, generation)
   if (retry.response.status !== 401) return retry.response
   await retry.response.text()
   throw new AccountAuthError(`${sub.label} is unauthorized`, true)
@@ -219,7 +262,7 @@ function abortable<T>(start: () => Promise<T>, signal: AbortSignal): Promise<T> 
   })
 }
 
-function forward(sub: Sub, body: string, signal: AbortSignal): Promise<Response> {
+function forward(sub: Sub, body: string, signal: AbortSignal, generation: number): Promise<Response> {
   return abortable(
     () => withAuthRetry(sub, (accessToken) => {
       const sessionId = crypto.randomUUID()
@@ -239,7 +282,7 @@ function forward(sub: Sub, body: string, signal: AbortSignal): Promise<Response>
         body,
         signal,
       })
-    }),
+    }, generation),
     signal,
   )
 }
@@ -253,6 +296,47 @@ function passthrough(upstream: Response, body: string | ReadableStream<Uint8Arra
   headers.delete("connection")
   headers.delete("keep-alive")
   return new Response(body, { status: upstream.status, headers })
+}
+
+function trackOpenStream(upstream: Response, signal: AbortSignal): Response {
+  if (!upstream.body) return upstream
+
+  const reader = upstream.body.getReader()
+  const streamId = Symbol()
+  let onAbort: (() => void) | null = null
+  state.openStreams.add(streamId)
+  const close = () => {
+    if (!state.openStreams.delete(streamId)) return
+    if (onAbort) signal.removeEventListener("abort", onAbort)
+  }
+  onAbort = () => {
+    close()
+    void reader.cancel(signal.reason).catch(() => {})
+  }
+  if (signal.aborted) onAbort()
+  else signal.addEventListener("abort", onAbort, { once: true })
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read()
+        if (done) {
+          close()
+          controller.close()
+        } else {
+          controller.enqueue(value)
+        }
+      } catch (error) {
+        close()
+        controller.error(error)
+      }
+    },
+    async cancel(reason) {
+      close()
+      await reader.cancel(reason).catch(() => {})
+    },
+  })
+  return passthrough(upstream, body)
 }
 
 interface CompletedResponse {
@@ -501,14 +585,15 @@ async function handleResponses(req: Request): Promise<Response> {
 
   for (let i = 0; i < attempts; i++) {
     const sub = await pickSub(req.signal)
+    const generation = credentialGeneration(sub.id)
     let res: Response
     try {
-      res = await forward(sub, body, req.signal)
+      res = await forward(sub, body, req.signal, generation)
     } catch (e) {
       state.lastError = e instanceof Error ? e.message : String(e)
       if (e instanceof AccountAuthError) {
         if (!e.permanent) return errorResponse(502, `token refresh failed: ${state.lastError}`)
-        exhaust(sub, undefined)
+        exhaust(sub, undefined, generation)
         terminalStatus = 503
         continue
       }
@@ -518,21 +603,27 @@ async function handleResponses(req: Request): Promise<Response> {
     if (res.ok) {
       state.requests++
       state.lastError = null
-      if (clientStream) return previousResponseId ? preservePreviousResponseId(res, previousResponseId) : passthrough(res)
-      return await aggregateResponse(res, responseInputItems(parsed.input), previousResponseId)
+      const tracked = trackOpenStream(res, req.signal)
+      if (clientStream) return previousResponseId ? preservePreviousResponseId(tracked, previousResponseId) : tracked
+      return await aggregateResponse(tracked, responseInputItems(parsed.input), previousResponseId)
     }
 
     const text = await res.text()
 
     // sub is used up — mark exhausted and fail over to the next one
     if (isUsageLimitError(res.status, text)) {
-      const usage = await usageOf(sub, true, AbortSignal.any([req.signal, AbortSignal.timeout(usageTimeoutMs())])).catch(() => undefined)
-      exhaust(sub, usage)
+      const usage = await usageOf(sub, true, AbortSignal.any([req.signal, AbortSignal.timeout(usageTimeoutMs())]), generation).catch(() => undefined)
+      exhaust(sub, usage, generation)
       state.lastError = `${sub.label} used up, failing over`
       continue
     }
 
-    // anything else is a real upstream error — pass it through
+    // Anything else is a real upstream error — pass it through. Keep transient
+    // 429 telemetry separate from terminal subscription usage limits above.
+    if (res.status === 429) {
+      state.rateLimits++
+      state.lastRateLimitAt = Date.now()
+    }
     state.lastError = `upstream ${res.status}`
     return passthrough(res, text)
   }
@@ -579,6 +670,7 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)])
   let failure = new ApiError(502, "models request failed")
   for (const sub of subs) {
+    const generation = credentialGeneration(sub.id)
     let res: Response
     try {
       res = await abortable(
@@ -592,13 +684,14 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
             },
             signal: requestSignal,
           }),
+          generation,
         ),
         requestSignal,
       )
     } catch (e) {
       if (e instanceof AccountAuthError) {
         failure = new ApiError(e.permanent ? 503 : 502, `token refresh failed: ${e.message}`)
-        if (e.permanent) exhaust(sub, undefined)
+        if (e.permanent) exhaust(sub, undefined, generation)
       } else {
         failure = new ApiError(502, `models request failed: ${e instanceof Error ? e.message : String(e)}`)
       }
@@ -606,7 +699,7 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
     }
     if (res.status === 403) {
       await res.text()
-      exhaust(sub, undefined)
+      exhaust(sub, undefined, generation)
       failure = new ApiError(503, `${sub.label} cannot access the models catalog`)
       continue
     }
@@ -618,6 +711,7 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
 
     try {
       const ids = await parseModelIds(res)
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal)
       modelCache = { at: Date.now(), ids }
       return ids
     } catch (e) {
@@ -683,4 +777,5 @@ export function stopProxy(): void {
   state.server = null
   state.port = 0
   state.currentId = null
+  state.openStreams.clear()
 }
