@@ -1,13 +1,20 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test"
+import { Database } from "bun:sqlite"
+import { mkdtempSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import * as proxy from "./src/proxy.ts"
+import { closeResponseCache } from "./src/response-cache.ts"
 import type { Sub } from "./src/types.ts"
 
 const hits: string[] = []
+const usageHits: string[] = []
 let lastAccept: string | null = null
 let lastBody: Record<string, unknown> | null = null
 let refreshHits = 0
 let modelHits = 0
 let modelClientVersion: string | null = null
+const responseCacheDir = mkdtempSync(join(tmpdir(), "subby-response-cache-"))
 
 function freshAccessToken(): string {
   const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3_600 })).toString("base64url")
@@ -32,8 +39,9 @@ const upstream = Bun.serve({
       return Response.json({ models: [{ slug: "gpt-5.6-sol" }, { slug: "gpt-dynamic" }] })
     }
     if (url.pathname === "/wham/usage") {
+      usageHits.push(acct!)
       if (acct === "D") return new Response("usage unavailable", { status: 503 })
-      if (acct === "H") {
+      if (acct === "H" || acct === "L") {
         await Bun.sleep(1_000)
         return Response.json({ plan_type: "plus", rate_limit: { primary_window: { used_percent: 0 } } })
       }
@@ -48,7 +56,7 @@ const upstream = Bun.serve({
       lastAccept = req.headers.get("accept")
       const body = (await req.json()) as Record<string, unknown>
       lastBody = body
-      if (acct === "A") return Response.json({ error: { message: "Monthly usage limit reached (GoUsageLimitError)" } }, { status: 429 })
+      if (acct === "A" || acct === "L") return Response.json({ error: { message: "Monthly usage limit reached (GoUsageLimitError)" } }, { status: 429 })
       if (acct === "B" && body.fail) return Response.json({ error: { message: "Monthly usage limit reached" } }, { status: 429 })
       if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
         if (body.delayAuth) await Bun.sleep(50)
@@ -58,7 +66,7 @@ const upstream = Bun.serve({
       if (body.model === "test-rate-limit") return Response.json({ error: { message: "Too many concurrent requests" } }, { status: 429 })
       const status = body.model === "test-incomplete" ? "incomplete" : body.model === "test-failed" ? "failed" : "completed"
       const response = {
-        id: "resp_1",
+        id: typeof body.test_response_id === "string" ? body.test_response_id : "resp_1",
         account: acct,
         store: body.store,
         model: body.model,
@@ -123,6 +131,7 @@ let base = ""
 
 beforeAll(() => {
   process.env.SUBBY_CHATGPT_BASE = `http://127.0.0.1:${upstream.port}`
+  process.env.SUBBY_RESPONSE_CACHE_PATH = join(responseCacheDir, "responses.sqlite")
   process.env.SUBBY_OPENAI_TOKEN_URL = `http://127.0.0.1:${upstream.port}/oauth/token`
   proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
   proxy.setSubSaver(() => {})
@@ -132,9 +141,12 @@ beforeAll(() => {
 
 afterAll(() => {
   proxy.stopProxy()
+  closeResponseCache()
+  rmSync(responseCacheDir, { recursive: true, force: true })
   proxy.setSubSaver(null)
   delete process.env.SUBBY_CHATGPT_BASE
   delete process.env.SUBBY_OPENAI_TOKEN_URL
+  delete process.env.SUBBY_RESPONSE_CACHE_PATH
   upstream.stop(true)
 })
 
@@ -189,27 +201,106 @@ describe("subby proxy", () => {
     }
   })
 
-  test("rotates to most available sub on first request", async () => {
-    // A=100% used, B=40%, C=10% → C should win
+  test("selects the first available sub without a usage preflight", async () => {
     const res = await responses({ model: "gpt-5.4", input: "hi" })
     const j = await json(res)
     expect(res.status).toBe(200)
-    expect(j.account).toBe("C")
-    expect(hits).toEqual(["C"])
+    expect(j.account).toBe("B")
+    expect(hits).toEqual(["B"])
   })
 
   test("stays sticky on the current sub", async () => {
     for (let i = 0; i < 3; i++) {
       const res = await responses({ model: "gpt-5.4", input: "again" })
-      expect((await json(res)).account).toBe("C")
+      expect((await json(res)).account).toBe("B")
     }
-    expect(hits.every((h) => h === "C")).toBe(true)
+    expect(hits.every((h) => h === "B")).toBe(true)
+  })
+
+  test("routes prompt cache keys across subscriptions and keeps each key sticky", async () => {
+    proxy.setSubSource(() => [makeSub("C"), makeSub("G"), makeSub("I")])
+    const routes = new Map<string, string>()
+
+    for (let i = 0; i < 12; i++) {
+      const key = `workspace-${i}`
+      const result = await json(await responses({ model: "gpt-5.4", input: "shared prefix", prompt_cache_key: key }))
+      routes.set(key, result.account)
+    }
+    expect(new Set(routes.values()).size).toBeGreaterThan(1)
+
+    for (const [key, account] of routes) {
+      const result = await json(await responses({ model: "gpt-5.4", input: "shared prefix plus another turn", prompt_cache_key: key }))
+      expect(result.account).toBe(account)
+    }
+  })
+
+  test("keeps previous_response_id chains on their serving subscription", async () => {
+    proxy.setSubSource(() => [makeSub("C"), makeSub("G"), makeSub("I")])
+    const responseId = "resp_affinity_owner"
+    const first = await json(await responses({
+      model: "gpt-5.4",
+      input: "turn one",
+      prompt_cache_key: "chain-owner",
+      test_response_id: responseId,
+    }))
+
+    let otherAccount: string | null = null
+    for (let i = 0; i < 12 && !otherAccount; i++) {
+      const result = await json(await responses({ model: "gpt-5.4", input: "unrelated", prompt_cache_key: `other-${i}` }))
+      if (result.account !== first.account) otherAccount = result.account
+    }
+    expect(otherAccount).not.toBeNull()
+
+    const continued = await json(await responses({ model: "gpt-5.4", input: "turn two", previous_response_id: responseId }))
+    expect(continued.account).toBe(first.account)
+  })
+
+  test("reports routing activity by subscription", async () => {
+    proxy.setSubSource(() => [makeSub("C"), makeSub("G"), makeSub("I")])
+    const before = proxy.info()
+
+    await responses({ model: "gpt-5.4", input: "sticky telemetry" })
+    await responses({ model: "gpt-5.4", input: "affinity telemetry", prompt_cache_key: "telemetry" })
+
+    const after = proxy.info()
+    const beforeByActiveSub = ["C", "G", "I"].reduce((sum, id) => sum + (before.requestsBySub[id] ?? 0), 0)
+    const afterByActiveSub = ["C", "G", "I"].reduce((sum, id) => sum + (after.requestsBySub[id] ?? 0), 0)
+    expect(after.requests).toBe(before.requests + 2)
+    expect(after.affinityRequests).toBe(before.affinityRequests + 1)
+    expect(afterByActiveSub).toBe(beforeByActiveSub + 2)
+    expect(after.lastRoute).toBe("affinity")
+  })
+
+  test("keeps unkeyed traffic sticky after affinity requests", async () => {
+    proxy.setSubSource(() => [makeSub("C"), makeSub("G"), makeSub("I")])
+    const stickyAccount = (await json(await responses({ model: "gpt-5.4", input: "sticky before affinity" }))).account
+
+    let affinityAccount = stickyAccount
+    for (let i = 0; i < 12 && affinityAccount === stickyAccount; i++) {
+      affinityAccount = (await json(await responses({
+        model: "gpt-5.4",
+        input: "keyed traffic",
+        prompt_cache_key: `sticky-isolation-${i}`,
+      }))).account
+    }
+    expect(affinityAccount).not.toBe(stickyAccount)
+
+    const after = await json(await responses({ model: "gpt-5.4", input: "sticky after affinity" }))
+    expect(after.account).toBe(stickyAccount)
   })
 
   test("forces store:false like the codex backend requires", async () => {
     const res = await responses({ model: "gpt-5.4", input: "x", store: true })
     const j = await json(res)
     expect(j.store).toBe(false)
+  })
+
+  test("normalizes string input to the Codex backend list shape", async () => {
+    const res = await responses({ model: "gpt-5.4", input: "hello" })
+    expect(res.status).toBe(200)
+    expect(lastBody?.input).toEqual([
+      { role: "user", content: [{ type: "input_text", text: "hello" }] },
+    ])
   })
 
   test("aggregates SSE into JSON for explicit non-streaming clients", async () => {
@@ -288,23 +379,28 @@ describe("subby proxy", () => {
     expect((await json(res)).id).toBe("resp_1")
   })
 
-  test("uses an account with unknown usage when confirmed accounts are exhausted", async () => {
-    proxy.setSubSource(() => [makeSub("E"), makeSub("D")])
-    const res = await responses({ model: "gpt-5.4", input: "usage fallback" })
+  test("does not wait for usage telemetry before forwarding", async () => {
+    proxy.setSubSource(() => [makeSub("H"), makeSub("I")])
+    const usageRequests = usageHits.length
+    const started = performance.now()
+    const res = await responses({ model: "gpt-5.4", input: "usage latency" })
+
     expect(res.status).toBe(200)
-    expect((await json(res)).account).toBe("D")
+    expect((await json(res)).account).toBe("H")
+    expect(performance.now() - started).toBeLessThan(500)
+    expect(usageHits).toHaveLength(usageRequests)
   })
 
-  test("does not let a hung usage request block a healthy account", async () => {
-    process.env.SUBBY_USAGE_TIMEOUT_MS = "20"
-    proxy.setSubSource(() => [makeSub("H"), makeSub("I")])
-    try {
-      const res = await responses({ model: "gpt-5.4", input: "usage timeout" })
-      expect(res.status).toBe(200)
-      expect((await json(res)).account).toBe("I")
-    } finally {
-      delete process.env.SUBBY_USAGE_TIMEOUT_MS
-    }
+  test("fails over before refreshing an exhausted subscription's usage", async () => {
+    proxy.setSubSource(() => [makeSub("L"), makeSub("I")])
+    hits.length = 0
+    const started = performance.now()
+    const res = await responses({ model: "gpt-5.4", input: "usage failover latency" })
+
+    expect(res.status).toBe(200)
+    expect((await json(res)).account).toBe("I")
+    expect(performance.now() - started).toBeLessThan(500)
+    expect(hits).toEqual(["L", "I"])
   })
 
   test("deduplicates concurrent refreshes after 401 responses", async () => {
@@ -441,6 +537,24 @@ describe("subby proxy", () => {
     expect(input[1]!.role).toBe("user")
   })
 
+  test("does not break responses when the transcript cache cannot open", async () => {
+    const cachePath = process.env.SUBBY_RESPONSE_CACHE_PATH!
+    closeResponseCache()
+    process.env.SUBBY_RESPONSE_CACHE_PATH = responseCacheDir
+    try {
+      const aggregated = await responses({ model: "gpt-5.4", input: "uncached", test_response_id: "resp_cache_failure" })
+      expect(aggregated.status).toBe(200)
+
+      const streamed = await responses({ model: "gpt-5.4", input: "uncached stream", stream: true, test_response_id: "resp_stream_cache_failure" })
+      expect(streamed.status).toBe(200)
+      expect(await streamed.text()).toContain("response.completed")
+      expect(proxy.info().lastError).toMatch(/response cache write failed/i)
+    } finally {
+      closeResponseCache()
+      process.env.SUBBY_RESPONSE_CACHE_PATH = cachePath
+    }
+  })
+
   test("emulates previous_response_id chaining by inlining the cached transcript", async () => {
     proxy.setSubSource(() => [makeSub("C")])
     const first = await responses({ model: "gpt-5.4", input: "turn one" })
@@ -457,9 +571,26 @@ describe("subby proxy", () => {
     expect(lastBody?.previous_response_id).toBeUndefined()
     const forwarded = lastBody?.input as Record<string, unknown>[]
     expect(forwarded).toHaveLength(3)
-    expect(forwarded[0]).toEqual({ role: "user", content: "turn one" })
+    expect(forwarded[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "turn one" }] })
     expect(forwarded[1]!.type).toBe("message")
     expect(forwarded[2]!.type).toBe("function_call_output")
+  })
+
+  test("keeps more than 100 responses on disk across a cache reopen", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const firstId = "resp_pressure_0"
+    expect((await responses({ model: "gpt-5.4", input: "first", test_response_id: firstId })).status).toBe(200)
+
+    for (let i = 1; i <= 100; i++) {
+      const res = await responses({ model: "gpt-5.4", input: `filler ${i}`, test_response_id: `resp_pressure_${i}` })
+      expect(res.status).toBe(200)
+    }
+    closeResponseCache()
+
+    const res = await responses({ model: "gpt-5.4", input: "continue", previous_response_id: firstId })
+    expect(res.status).toBe(200)
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "first" }] })
   })
 
   test("preserves previous_response_id in chained streams", async () => {
@@ -475,6 +606,21 @@ describe("subby proxy", () => {
     expect(res.status).toBe(200)
     expect(await res.text()).toContain(`"previous_response_id":"${firstId}"`)
     expect(lastBody?.previous_response_id).toBeUndefined()
+  })
+
+  test("caches streaming responses for later continuation", async () => {
+    proxy.setSubSource(() => [makeSub("C")])
+    const firstId = "resp_streamed"
+    const first = await responses({ model: "gpt-5.4", input: "streamed turn", stream: true, test_response_id: firstId })
+    expect(first.status).toBe(200)
+    expect(await first.text()).toContain(`"id":"${firstId}"`)
+
+    const res = await responses({ model: "gpt-5.4", input: "continue", previous_response_id: firstId })
+    expect(res.status).toBe(200)
+    const forwarded = lastBody?.input as Record<string, unknown>[]
+    expect(forwarded[0]).toEqual({ role: "user", content: [{ type: "input_text", text: "streamed turn" }] })
+    expect(forwarded[1]!.type).toBe("message")
+    expect(forwarded[2]).toEqual({ role: "user", content: [{ type: "input_text", text: "continue" }] })
   })
 
   test("replays encrypted reasoning items when chaining", async () => {
@@ -495,5 +641,49 @@ describe("subby proxy", () => {
     expect(forwarded[1]).toEqual({ type: "reasoning", encrypted_content: "encrypted" })
     expect(forwarded[2]!.type).toBe("function_call")
     expect(forwarded[3]!.type).toBe("function_call_output")
+  })
+
+  test("keeps cache limits consistent across concurrent processes", async () => {
+    const cachePath = join(responseCacheDir, "concurrent.sqlite")
+    const moduleUrl = new URL("./src/response-cache.ts", import.meta.url).href
+    // Each child imports the module at runtime to create its own process-local connection.
+    const script = `
+      const { cacheResponse, closeResponseCache } = await import(${JSON.stringify(moduleUrl)})
+      const worker = process.env.CACHE_WORKER
+      for (let i = 0; i < 100; i++) {
+        cacheResponse("shared", [{ worker, i }], [{ ok: true }], worker)
+        cacheResponse(worker + "-" + i, [{ worker, i }], [{ ok: true }], worker)
+      }
+      closeResponseCache()
+    `
+    const children = ["a", "b"].map((worker) => Bun.spawn([process.execPath, "-e", script], {
+      cwd: import.meta.dir,
+      env: {
+        ...process.env,
+        CACHE_WORKER: worker,
+        SUBBY_RESPONSE_CACHE_PATH: cachePath,
+        SUBBY_RESPONSE_CACHE_MAX_ENTRIES: "50",
+      },
+      stderr: "pipe",
+    }))
+    const results = await Promise.all(children.map(async (child) => ({
+      code: await child.exited,
+      stderr: await new Response(child.stderr).text(),
+    })))
+    expect(results).toEqual([
+      { code: 0, stderr: "" },
+      { code: 0, stderr: "" },
+    ])
+
+    const db = new Database(cachePath, { readonly: true, strict: true })
+    try {
+      const totals = db.query<{ entries: number; bytes: number }, []>(
+        "SELECT count(*) AS entries, coalesce(sum(bytes), 0) AS bytes FROM response_cache",
+      ).get()!
+      expect(totals.entries).toBeLessThanOrEqual(50)
+      expect(totals.bytes).toBeGreaterThan(0)
+    } finally {
+      db.close(true)
+    }
   })
 })
