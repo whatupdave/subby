@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto"
 import { loadSubs, saveSubs } from "./store.ts"
 import { ensureFreshToken, fetchUsage, TokenRefreshError } from "./codex.ts"
+import { cachedResponse, cacheResponse } from "./response-cache.ts"
 import type { Sub, Usage } from "./types.ts"
 
 const upstreamBase = () => process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.com/backend-api"
@@ -9,7 +11,6 @@ const modelsUrl = () => {
   url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.147.0")
   return url
 }
-const USAGE_CACHE_TTL_MS = 60_000
 const MODEL_CACHE_TTL_MS = 5 * 60_000
 const MODEL_REQUEST_TIMEOUT_MS = 5_000
 const usageTimeoutMs = () => Number(process.env.SUBBY_USAGE_TIMEOUT_MS) || 5_000
@@ -46,8 +47,12 @@ interface ProxyState {
   host: string
   port: number
   currentId: string | null
+  stickyId: string | null
   exhausted: Map<string, number>
   requests: number
+  affinityRequests: number
+  requestsBySub: Map<string, number>
+  lastRoute: "affinity" | "sticky" | null
   openStreams: Set<symbol>
   rateLimits: number
   lastRateLimitAt: number | null
@@ -59,8 +64,12 @@ const state: ProxyState = {
   host: "127.0.0.1",
   port: 0,
   currentId: null,
+  stickyId: null,
   exhausted: new Map<string, number>(),
   requests: 0,
+  affinityRequests: 0,
+  requestsBySub: new Map<string, number>(),
+  lastRoute: null,
   openStreams: new Set(),
   rateLimits: 0,
   lastRateLimitAt: null,
@@ -92,6 +101,9 @@ export interface ProxyInfo {
   url: string | null
   currentId: string | null
   requests: number
+  affinityRequests: number
+  requestsBySub: Record<string, number>
+  lastRoute: "affinity" | "sticky" | null
   openStreams: number
   rateLimits: number
   lastRateLimitAt: number | null
@@ -109,6 +121,9 @@ export function info(): ProxyInfo {
     url: running ? `http://${host}:${state.port}/v1` : null,
     currentId: state.currentId,
     requests: state.requests,
+    affinityRequests: state.affinityRequests,
+    requestsBySub: Object.fromEntries(state.requestsBySub),
+    lastRoute: state.lastRoute,
     openStreams: state.openStreams.size,
     rateLimits: state.rateLimits,
     lastRateLimitAt: state.lastRateLimitAt,
@@ -117,7 +132,6 @@ export function info(): ProxyInfo {
   }
 }
 
-const usageCache = new Map<string, { at: number; usage: Usage }>()
 const pendingTokenSaves = new Set<string>()
 const credentialGenerations = new Map<string, number>()
 
@@ -128,7 +142,6 @@ function credentialGeneration(id: string): number {
 export function credentialsUpdated(id: string): void {
   credentialGenerations.set(id, credentialGeneration(id) + 1)
   state.exhausted.delete(id)
-  usageCache.delete(id)
   pendingTokenSaves.delete(id)
 }
 
@@ -140,20 +153,12 @@ function saveRefreshedToken(sub: Sub, previousAccessToken: string, generation: n
   pendingTokenSaves.delete(sub.id)
 }
 
-async function usageOf(sub: Sub, force: boolean, signal: AbortSignal, generation = credentialGeneration(sub.id)): Promise<Usage> {
-  const cached = usageCache.get(sub.id)
-  if (!force && cached && Date.now() - cached.at < USAGE_CACHE_TTL_MS) return cached.usage
+async function refreshExhaustion(sub: Sub, generation: number): Promise<void> {
   const before = sub.tokens.access
-  const usage = await fetchUsage(sub, signal).catch((e) => ({ error: String(e?.message ?? e) }) as Usage)
-  if (generation !== credentialGeneration(sub.id)) return usage
+  const usage = await fetchUsage(sub, AbortSignal.timeout(usageTimeoutMs())).catch(() => undefined)
+  if (!usage || generation !== credentialGeneration(sub.id)) return
   saveRefreshedToken(sub, before, generation)
-  usageCache.set(sub.id, { at: Date.now(), usage })
-  return usage
-}
-
-function effectivePct(u: Usage): number {
-  if (u.error) return 100
-  return Math.max(u.session?.pct ?? 0, u.weekly?.pct ?? 0)
+  exhaust(sub, usage, generation)
 }
 
 function exhaust(sub: Sub, usage: Usage | undefined, generation: number): void {
@@ -171,22 +176,45 @@ function exhaust(sub: Sub, usage: Usage | undefined, generation: number): void {
       : now + 5 * 60_000
   state.exhausted.set(sub.id, until)
   if (state.currentId === sub.id) state.currentId = null
+  if (state.stickyId === sub.id) state.stickyId = null
+}
+
+interface SubAffinity {
+  key: string
+  preferredSubId: string | null
+}
+
+function affinitySub(usable: Sub[], affinity: SubAffinity): Sub {
+  const preferred = usable.find((sub) => sub.id === affinity.preferredSubId)
+  if (preferred) return preferred
+
+  let selected = usable[0]!
+  let highest = createHash("sha256").update(affinity.key).update("\0").update(selected.id).digest().readBigUInt64BE()
+  for (let i = 1; i < usable.length; i++) {
+    const candidate = usable[i]!
+    const score = createHash("sha256").update(affinity.key).update("\0").update(candidate.id).digest().readBigUInt64BE()
+    if (score <= highest) continue
+    selected = candidate
+    highest = score
+  }
+  return selected
 }
 
 /**
- * Pick the sub to serve a request. Sticky: keep the current sub while it's
- * usable; only when it's used up (marked exhausted) pick the most available
- * remaining one (lowest session/weekly usage).
+ * Pick the sub to serve a request without blocking on usage telemetry.
+ * Affinity requests use rendezvous hashing; unkeyed requests stay sticky.
  */
-async function pickSub(signal: AbortSignal): Promise<Sub> {
+function pickSub(affinity: SubAffinity | null): Sub {
   const now = Date.now()
   for (const [id, until] of state.exhausted) if (until <= now) state.exhausted.delete(id)
 
   const codexSubs = getSubs().filter((s) => s.provider === "codex")
   if (!codexSubs.length) throw new ApiError(503, "no codex subs configured in subby")
 
-  const current = codexSubs.find((s) => s.id === state.currentId && !state.exhausted.has(s.id))
-  if (current) return current
+  if (!affinity) {
+    const current = codexSubs.find((s) => s.id === state.stickyId && !state.exhausted.has(s.id))
+    if (current) return current
+  }
 
   const available = codexSubs.filter((s) => !state.exhausted.has(s.id))
   if (!available.length) {
@@ -194,24 +222,10 @@ async function pickSub(signal: AbortSignal): Promise<Sub> {
     throw new ApiError(429, `all codex subs are used up; next reset in ${Math.ceil((soonest - now) / 60_000)} min`)
   }
 
-  const usageSignal = AbortSignal.any([signal, AbortSignal.timeout(usageTimeoutMs())])
-  const scored = await Promise.all(
-    available.map(async (sub) => {
-      const generation = credentialGeneration(sub.id)
-      const usage = await usageOf(sub, false, usageSignal, generation)
-      return { sub, usage, pct: effectivePct(usage), generation }
-    }),
-  )
-  if (signal.aborted) throw signal.reason
-  if (scored.some(({ sub, generation }) => generation !== credentialGeneration(sub.id))) return pickSub(signal)
-  for (const { sub, usage, pct, generation } of scored) {
-    if (pct >= 100 && !usage.error) exhaust(sub, usage, generation)
-  }
-  const usable = scored.filter(({ sub }) => !state.exhausted.has(sub.id))
-  if (!usable.length) throw new ApiError(429, "all codex subs are used up")
-  const best = usable.reduce((lowest, candidate) => candidate.pct < lowest.pct ? candidate : lowest)
-  state.currentId = best.sub.id
-  return best.sub
+  const selected = affinity ? affinitySub(available, affinity) : available[0]!
+  if (!affinity) state.stickyId = selected.id
+  state.currentId = selected.id
+  return selected
 }
 
 async function withAccessToken(sub: Sub, forceFresh: boolean, request: (accessToken: string) => Promise<Response>, generation: number) {
@@ -350,6 +364,7 @@ interface ResponseStreamState {
   error?: unknown
   items: Map<number, unknown>
   nextItemIndex: number
+  remembered?: boolean
 }
 
 const SSE_EVENT_SEPARATOR = /(?:\r\n|\r|\n){2}/
@@ -386,7 +401,15 @@ function consumeSseEvent(chunk: string, state: ResponseStreamState): void {
   if (event.type === "error") state.error = event
 }
 
-async function aggregateResponse(upstream: Response, input: unknown[], previousResponseId: string | null): Promise<Response> {
+function rememberTerminalResponse(state: ResponseStreamState, input: unknown[], subId: string): void {
+  const terminal = state.terminal
+  if (!terminal || state.remembered) return
+  if (!terminal.output?.length) terminal.output = [...state.items.entries()].sort(([a], [b]) => a - b).map(([, item]) => item)
+  rememberResponse(terminal, input, subId)
+  state.remembered = true
+}
+
+async function aggregateResponse(upstream: Response, input: unknown[], previousResponseId: string | null, subId: string): Promise<Response> {
   if (!upstream.body) return errorResponse(502, "upstream returned an empty response stream")
   const reader = upstream.body.getReader()
   const decoder = new TextDecoder()
@@ -421,9 +444,8 @@ async function aggregateResponse(upstream: Response, input: unknown[], previousR
     const detail = state.error ? `: ${JSON.stringify(state.error).slice(0, 300)}` : ""
     return errorResponse(502, `upstream stream ended without a terminal response event${detail}`)
   }
-  if (!terminal.output?.length) terminal.output = [...state.items.entries()].sort(([a], [b]) => a - b).map(([, item]) => item)
+  rememberTerminalResponse(state, input, subId)
   if (previousResponseId) terminal.previous_response_id = previousResponseId
-  rememberResponse(terminal, input)
   return Response.json(terminal)
 }
 
@@ -458,10 +480,11 @@ function rewriteSsePreviousResponseId(frame: string, previousResponseId: string)
     .join("\n")
 }
 
-function preservePreviousResponseId(upstream: Response, previousResponseId: string): Response {
+function captureStream(upstream: Response, input: unknown[], previousResponseId: string | null, subId: string): Response {
   if (!upstream.body) return passthrough(upstream)
   const decoder = new TextDecoder()
   const encoder = new TextEncoder()
+  const state: ResponseStreamState = { items: new Map(), nextItemIndex: 0 }
   let buffer = ""
   const body = upstream.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
@@ -470,70 +493,52 @@ function preservePreviousResponseId(upstream: Response, previousResponseId: stri
       while (separator?.index !== undefined) {
         const frame = buffer.slice(0, separator.index)
         buffer = buffer.slice(separator.index + separator[0].length)
-        controller.enqueue(encoder.encode(`${rewriteSsePreviousResponseId(frame, previousResponseId)}\n\n`))
+        consumeSseEvent(frame, state)
+        rememberTerminalResponse(state, input, subId)
+        if (previousResponseId) {
+          controller.enqueue(encoder.encode(`${rewriteSsePreviousResponseId(frame, previousResponseId)}\n\n`))
+        }
         separator = SSE_EVENT_SEPARATOR.exec(buffer)
       }
+      if (!previousResponseId) controller.enqueue(chunk)
     },
     flush(controller) {
       buffer += decoder.decode()
-      if (buffer) controller.enqueue(encoder.encode(rewriteSsePreviousResponseId(buffer, previousResponseId)))
+      if (!buffer) return
+      consumeSseEvent(buffer, state)
+      rememberTerminalResponse(state, input, subId)
+      if (previousResponseId) controller.enqueue(encoder.encode(rewriteSsePreviousResponseId(buffer, previousResponseId)))
     },
   }))
   return passthrough(upstream, body)
 }
 
-interface CachedResponse {
-  input: unknown[]
-  output: unknown[]
-  bytes: number
-}
-
-const responseCache = new Map<string, CachedResponse>()
-const RESPONSE_CACHE_MAX_ENTRIES = 100
-const RESPONSE_CACHE_MAX_BYTES = 16 * 1024 * 1024
-let responseCacheBytes = 0
-
 function responseInputItems(input: unknown): unknown[] {
   if (Array.isArray(input)) return input
   if (input === undefined || input === null) return []
-  if (typeof input === "string") return [{ role: "user", content: input }]
+  if (typeof input === "string") {
+    return [{ role: "user", content: [{ type: "input_text", text: input }] }]
+  }
   return [input]
 }
 
-function rememberResponse(completed: CompletedResponse, input: unknown[]): void {
+function rememberResponse(completed: CompletedResponse, input: unknown[], subId: string): void {
   if (typeof completed.id !== "string" || !Array.isArray(completed.output)) return
-  const output = completed.output
-  const bytes = Buffer.byteLength(JSON.stringify([input, output]))
-  if (bytes > RESPONSE_CACHE_MAX_BYTES) return
-
-  const existing = responseCache.get(completed.id)
-  if (existing) {
-    responseCacheBytes -= existing.bytes
-    responseCache.delete(completed.id)
-  }
-  responseCache.set(completed.id, { input, output, bytes })
-  responseCacheBytes += bytes
-
-  while (responseCache.size > RESPONSE_CACHE_MAX_ENTRIES || responseCacheBytes > RESPONSE_CACHE_MAX_BYTES) {
-    const oldestId = responseCache.keys().next().value
-    if (oldestId === undefined) break
-    responseCacheBytes -= responseCache.get(oldestId)!.bytes
-    responseCache.delete(oldestId)
+  try {
+    cacheResponse(completed.id, input, completed.output, subId)
+  } catch (error) {
+    state.lastError = `response cache write failed: ${error instanceof Error ? error.message : String(error)}`
   }
 }
 
-function inlinePreviousResponse(parsed: Record<string, unknown>): string | null {
+function inlinePreviousResponse(parsed: Record<string, unknown>): { id: string; subId: string } | string | null {
   if (parsed.previous_response_id === undefined || parsed.previous_response_id === null) return null
   const id = String(parsed.previous_response_id)
-  const prior = responseCache.get(id)
-  if (!prior) {
-    return "unknown previous_response_id: subby only caches non-streaming responses from this process"
-  }
-  responseCache.delete(id)
-  responseCache.set(id, prior)
+  const prior = cachedResponse(id)
+  if (!prior) return "unknown previous_response_id: subby has no cached response with that id"
   parsed.input = [...prior.input, ...prior.output, ...responseInputItems(parsed.input)]
   delete parsed.previous_response_id
-  return null
+  return { id, subId: prior.subId }
 }
 
 function normalizeForCodexBackend(parsed: Record<string, unknown>): void {
@@ -541,6 +546,7 @@ function normalizeForCodexBackend(parsed: Record<string, unknown>): void {
   delete parsed.prompt_cache_retention
   delete parsed.prompt_cache_options
   delete parsed.max_output_tokens
+  if (typeof parsed.input === "string") parsed.input = responseInputItems(parsed.input)
   if (!Array.isArray(parsed.input)) return
   for (const item of parsed.input) {
     if (!item || typeof item !== "object") continue
@@ -567,11 +573,14 @@ async function handleResponses(req: Request): Promise<Response> {
   } catch {
     return errorResponse(400, "invalid JSON body")
   }
-  const previousResponseId = parsed.previous_response_id === undefined || parsed.previous_response_id === null
-    ? null
-    : String(parsed.previous_response_id)
-  const chainError = inlinePreviousResponse(parsed)
-  if (chainError) return errorResponse(400, chainError)
+  const previous = inlinePreviousResponse(parsed)
+  if (typeof previous === "string") return errorResponse(400, previous)
+  const promptCacheKey = typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key
+    ? parsed.prompt_cache_key
+    : null
+  const affinity: SubAffinity | null = promptCacheKey || previous
+    ? { key: promptCacheKey ?? previous!.id, preferredSubId: previous?.subId ?? null }
+    : null
   parsed.store = false
   normalizeForCodexBackend(parsed)
   // The ChatGPT Codex backend only serves SSE ("Stream must be set to true"),
@@ -584,7 +593,7 @@ async function handleResponses(req: Request): Promise<Response> {
   let terminalStatus = 429
 
   for (let i = 0; i < attempts; i++) {
-    const sub = await pickSub(req.signal)
+    const sub = pickSub(affinity)
     const generation = credentialGeneration(sub.id)
     let res: Response
     try {
@@ -602,18 +611,22 @@ async function handleResponses(req: Request): Promise<Response> {
 
     if (res.ok) {
       state.requests++
+      if (affinity) state.affinityRequests++
+      state.requestsBySub.set(sub.id, (state.requestsBySub.get(sub.id) ?? 0) + 1)
+      state.lastRoute = affinity ? "affinity" : "sticky"
       state.lastError = null
       const tracked = trackOpenStream(res, req.signal)
-      if (clientStream) return previousResponseId ? preservePreviousResponseId(tracked, previousResponseId) : tracked
-      return await aggregateResponse(tracked, responseInputItems(parsed.input), previousResponseId)
+      const input = responseInputItems(parsed.input)
+      if (clientStream) return captureStream(tracked, input, previous?.id ?? null, sub.id)
+      return await aggregateResponse(tracked, input, previous?.id ?? null, sub.id)
     }
 
     const text = await res.text()
 
     // sub is used up — mark exhausted and fail over to the next one
     if (isUsageLimitError(res.status, text)) {
-      const usage = await usageOf(sub, true, AbortSignal.any([req.signal, AbortSignal.timeout(usageTimeoutMs())]), generation).catch(() => undefined)
-      exhaust(sub, usage, generation)
+      exhaust(sub, undefined, generation)
+      void refreshExhaustion(sub, generation).catch(() => {})
       state.lastError = `${sub.label} used up, failing over`
       continue
     }
@@ -777,5 +790,6 @@ export function stopProxy(): void {
   state.server = null
   state.port = 0
   state.currentId = null
+  state.stickyId = null
   state.openStreams.clear()
 }
