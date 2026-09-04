@@ -27,6 +27,15 @@ The proxy implements:
 
 Model endpoints use a five-minute cache of the authenticated Codex model catalog, so newly available models do not require a subby release.
 
+Scope either model endpoint to one Codex subscription with its exact label from the TUI or its stable subscription ID:
+
+```bash
+curl http://127.0.0.1:8787/v1/models \
+  -H 'X-Subby-Subscription: you@example.com'
+```
+
+Scoped catalogs have separate five-minute caches and never fall back to another subscription.
+
 Point an OpenAI Responses API client at it:
 
 ```bash
@@ -70,7 +79,7 @@ Routing never waits for the usage endpoint. A terminal usage-limit response imme
 | `SUBBY_HOST` | `127.0.0.1` | Proxy bind address |
 | `SUBBY_PORT` | `8787` | Proxy port |
 | `SUBBY_KEY` | unset | If set, require `Authorization: Bearer <value>` |
-| `SUBBY_CODEX_CLIENT_VERSION` | `0.147.0` | Codex compatibility version sent when fetching the model catalog |
+| `SUBBY_CODEX_CLIENT_VERSION` | `0.153.2` | Codex compatibility version sent when fetching the model catalog |
 | `SUBBY_USAGE_TIMEOUT_MS` | `5000` | Timeout for background usage refresh after a subscription is exhausted |
 | `SUBBY_RESPONSE_CACHE_PATH` | `~/.subby/response-cache.sqlite` | Response transcript cache file |
 | `SUBBY_RESPONSE_CACHE_MAX_ENTRIES` | `10000` | Maximum cached responses |

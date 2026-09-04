@@ -36,6 +36,7 @@ const upstream = Bun.serve({
       modelHits++
       modelClientVersion = url.searchParams.get("client_version")
       if (acct === "A") return new Response("forbidden", { status: 403 })
+      if (acct === "C") return Response.json({ models: [{ slug: "gpt-for-C" }] })
       return Response.json({ models: [{ slug: "gpt-5.6-sol" }, { slug: "gpt-dynamic" }] })
     }
     if (url.pathname === "/wham/usage") {
@@ -173,7 +174,7 @@ describe("subby proxy", () => {
     expect(res.status).toBe(200)
     expect(j.object).toBe("list")
     expect(j.data.map((m: any) => m.id)).toEqual(["gpt-5.6-sol", "gpt-dynamic"])
-    expect(modelClientVersion).toBe("0.147.0")
+    expect(modelClientVersion).toBe("0.153.2")
   })
 
   test("/v1/models/:model retrieves a model from the cached catalog", async () => {
@@ -199,6 +200,35 @@ describe("subby proxy", () => {
     } finally {
       proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
     }
+  })
+
+  test("scopes model endpoints to the selected subscription", async () => {
+    const before = modelHits
+    const byLabel = { headers: { "x-subby-subscription": "sub-C" } }
+    const list = await fetch(`${base}/v1/models`, byLabel)
+    expect(list.status).toBe(200)
+    expect((await json(list)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-for-C"])
+
+    const detail = await fetch(`${base}/v1/models/gpt-for-C`, { headers: { "x-subby-subscription": "C" } })
+    expect(detail.status).toBe(200)
+    expect((await json(detail)).id).toBe("gpt-for-C")
+    expect(modelHits).toBe(before + 1)
+  })
+
+  test("rejects an unknown model subscription without contacting upstream", async () => {
+    const before = modelHits
+    const res = await fetch(`${base}/v1/models`, { headers: { "x-subby-subscription": "missing" } })
+    expect(res.status).toBe(404)
+    expect((await json(res)).error.message).toContain("subscription 'missing' not found")
+    expect(modelHits).toBe(before)
+  })
+
+  test("does not fall back when the selected subscription cannot list models", async () => {
+    const before = modelHits
+    const res = await fetch(`${base}/v1/models`, { headers: { "x-subby-subscription": "sub-A" } })
+    expect(res.status).toBe(503)
+    expect((await json(res)).error.message).toContain("sub-A cannot access")
+    expect(modelHits).toBe(before + 1)
   })
 
   test("selects the first available sub without a usage preflight", async () => {

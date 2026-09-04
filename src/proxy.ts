@@ -8,11 +8,12 @@ const upstreamBase = () => process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.co
 const responsesUrl = () => `${upstreamBase()}/codex/responses`
 const modelsUrl = () => {
   const url = new URL(`${upstreamBase()}/codex/models`)
-  url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.147.0")
+  url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.153.2")
   return url
 }
 const MODEL_CACHE_TTL_MS = 5 * 60_000
 const MODEL_REQUEST_TIMEOUT_MS = 5_000
+const MODEL_SUBSCRIPTION_HEADER = "x-subby-subscription"
 const usageTimeoutMs = () => Number(process.env.SUBBY_USAGE_TIMEOUT_MS) || 5_000
 
 // Terminal usage-limit errors (plan exhausted) vs transient 429 rate limits
@@ -650,7 +651,7 @@ function modelObject(id: string) {
   return { id, object: "model", created: 0, owned_by: "openai" }
 }
 
-let modelCache: { at: number; ids: string[] } | null = null
+const modelCache = new Map<string, { at: number; ids: string[] }>()
 
 async function parseModelIds(res: Response): Promise<string[]> {
   let value: unknown
@@ -668,13 +669,28 @@ async function parseModelIds(res: Response): Promise<string[]> {
   return [...new Set(slugs)]
 }
 
-async function modelIds(signal: AbortSignal): Promise<string[]> {
-  const cached = modelCache
+function selectedModelSub(req: Request): Sub | null {
+  const selector = req.headers.get(MODEL_SUBSCRIPTION_HEADER)
+  if (selector === null) return null
+
+  const codexSubs = getSubs().filter((sub) => sub.provider === "codex")
+  const byId = codexSubs.find((sub) => sub.id === selector)
+  if (byId) return byId
+
+  const byLabel = codexSubs.filter((sub) => sub.label === selector)
+  if (byLabel.length === 1) return byLabel[0]!
+  if (byLabel.length > 1) throw new ApiError(409, `codex subscription '${selector}' is ambiguous; use its id`)
+  throw new ApiError(404, `codex subscription '${selector}' not found`)
+}
+
+async function modelIds(signal: AbortSignal, selectedSub: Sub | null): Promise<string[]> {
+  const cacheKey = selectedSub?.id ?? ""
+  const cached = modelCache.get(cacheKey)
   if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.ids
 
   const allSubs = getSubs().filter((sub) => sub.provider === "codex")
   const current = allSubs.find((sub) => sub.id === state.currentId)
-  const subs = current ? [current, ...allSubs.filter((sub) => sub !== current)] : allSubs
+  const subs = selectedSub ? [selectedSub] : current ? [current, ...allSubs.filter((sub) => sub !== current)] : allSubs
   if (!subs.length) {
     if (cached) return cached.ids
     throw new ApiError(503, "no codex subs configured in subby")
@@ -724,8 +740,8 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
 
     try {
       const ids = await parseModelIds(res)
-      if (generation !== credentialGeneration(sub.id)) return modelIds(signal)
-      modelCache = { at: Date.now(), ids }
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSub)
+      modelCache.set(cacheKey, { at: Date.now(), ids })
       return ids
     } catch (e) {
       failure = e instanceof ApiError ? e : new ApiError(502, "models upstream returned an invalid catalog")
@@ -736,12 +752,12 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
   throw failure
 }
 
-async function handleModels(signal: AbortSignal): Promise<Response> {
-  return Response.json({ object: "list", data: (await modelIds(signal)).map(modelObject) })
+async function handleModels(req: Request): Promise<Response> {
+  return Response.json({ object: "list", data: (await modelIds(req.signal, selectedModelSub(req))).map(modelObject) })
 }
 
-async function handleModel(id: string, signal: AbortSignal): Promise<Response> {
-  if (!(await modelIds(signal)).includes(id)) return errorResponse(404, `model '${id}' not found`)
+async function handleModel(req: Request, id: string): Promise<Response> {
+  if (!(await modelIds(req.signal, selectedModelSub(req))).includes(id)) return errorResponse(404, `model '${id}' not found`)
   return Response.json(modelObject(id))
 }
 
@@ -768,11 +784,11 @@ export function startProxy(port = Number(process.env.SUBBY_PORT) || 8787): void 
           return await handleResponses(req)
         }
         if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-          return await handleModels(req.signal)
+          return await handleModels(req)
         }
         if (req.method === "GET") {
           const match = url.pathname.match(/^\/(?:v1\/)?models\/(.+)$/)
-          if (match) return await handleModel(decodeURIComponent(match[1]!), req.signal)
+          if (match) return await handleModel(req, decodeURIComponent(match[1]!))
         }
         return errorResponse(404, `subby proxy: unknown route ${req.method} ${url.pathname}`)
       } catch (e) {
