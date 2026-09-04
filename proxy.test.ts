@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from "bun:test"
+import { describe, test, expect, beforeAll, afterAll, setSystemTime } from "bun:test"
 import { Database } from "bun:sqlite"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -14,6 +14,10 @@ let lastBody: Record<string, unknown> | null = null
 let refreshHits = 0
 let modelHits = 0
 let modelClientVersion: string | null = null
+let modelRequestStarted: (() => void) | null = null
+let modelRequestRelease: Promise<void> | null = null
+let responseRequestStarted: (() => void) | null = null
+let responseRequestRelease: Promise<void> | null = null
 const responseCacheDir = mkdtempSync(join(tmpdir(), "subby-response-cache-"))
 
 function freshAccessToken(): string {
@@ -36,6 +40,16 @@ const upstream = Bun.serve({
       modelHits++
       modelClientVersion = url.searchParams.get("client_version")
       if (acct === "A") return new Response("forbidden", { status: 403 })
+      if (acct === "C") return Response.json({ models: [{ slug: "gpt-for-C" }] })
+      if (acct === "R") {
+        modelRequestStarted?.()
+        if (modelRequestRelease) await modelRequestRelease
+        return new Response("forbidden", { status: 403 })
+      }
+      if (acct === "S") {
+        const model = req.headers.get("authorization") === "Bearer tok-S-new" ? "gpt-for-S-new" : "gpt-for-S-old"
+        return Response.json({ models: [{ slug: model }] })
+      }
       return Response.json({ models: [{ slug: "gpt-5.6-sol" }, { slug: "gpt-dynamic" }] })
     }
     if (url.pathname === "/wham/usage") {
@@ -59,7 +73,10 @@ const upstream = Bun.serve({
       if (acct === "A" || acct === "L") return Response.json({ error: { message: "Monthly usage limit reached (GoUsageLimitError)" } }, { status: 429 })
       if (acct === "B" && body.fail) return Response.json({ error: { message: "Monthly usage limit reached" } }, { status: 429 })
       if (acct === "F" || (acct === "J" && req.headers.get("authorization") === "Bearer tok-J")) {
-        if (body.delayAuth) await Bun.sleep(50)
+        if (body.delayAuth) {
+          responseRequestStarted?.()
+          if (responseRequestRelease) await responseRequestRelease
+        }
         return Response.json({ error: { message: "unauthorized" } }, { status: 401 })
       }
       if (!body.stream) return Response.json({ detail: "Stream must be set to true" }, { status: 400 })
@@ -173,7 +190,7 @@ describe("subby proxy", () => {
     expect(res.status).toBe(200)
     expect(j.object).toBe("list")
     expect(j.data.map((m: any) => m.id)).toEqual(["gpt-5.6-sol", "gpt-dynamic"])
-    expect(modelClientVersion).toBe("0.147.0")
+    expect(modelClientVersion).toBe("0.153.2")
   })
 
   test("/v1/models/:model retrieves a model from the cached catalog", async () => {
@@ -197,6 +214,107 @@ describe("subby proxy", () => {
       expect((await json(res)).data).toHaveLength(2)
       expect(modelHits).toBe(2)
     } finally {
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
+  })
+
+  test("scopes model endpoints to the selected subscription", async () => {
+    const before = modelHits
+    const byLabel = { headers: { "x-subby-subscription": "sub-C" } }
+    const list = await fetch(`${base}/v1/models`, byLabel)
+    expect(list.status).toBe(200)
+    expect((await json(list)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-for-C"])
+
+    const detail = await fetch(`${base}/v1/models/gpt-for-C`, { headers: { "x-subby-subscription": "C" } })
+    expect(detail.status).toBe(200)
+    expect((await json(detail)).id).toBe("gpt-for-C")
+    expect(modelHits).toBe(before + 1)
+  })
+
+  test("rejects an unknown model subscription without contacting upstream", async () => {
+    const before = modelHits
+    const res = await fetch(`${base}/v1/models`, { headers: { "x-subby-subscription": "missing" } })
+    expect(res.status).toBe(404)
+    expect((await json(res)).error.message).toContain("subscription 'missing' not found")
+    expect(modelHits).toBe(before)
+  })
+
+  test("does not fall back when the selected subscription cannot list models", async () => {
+    const before = modelHits
+    const res = await fetch(`${base}/v1/models`, { headers: { "x-subby-subscription": "sub-A" } })
+    expect(res.status).toBe(503)
+    expect((await json(res)).error.message).toContain("sub-A cannot access")
+    expect(modelHits).toBe(before + 1)
+  })
+
+  test("does not serve an expired scoped catalog when its subscription fails", async () => {
+    const sub = makeSub("Z")
+    sub.tokens.accountId = "C"
+    proxy.setSubSource(() => [sub])
+    const headers = { "x-subby-subscription": sub.label }
+
+    try {
+      const cached = await fetch(`${base}/v1/models`, { headers })
+      expect(cached.status).toBe(200)
+      setSystemTime(Date.now() + 5 * 60_000 + 1)
+      sub.tokens.accountId = "A"
+
+      const res = await fetch(`${base}/v1/models`, { headers })
+      expect(res.status).toBe(503)
+      expect((await json(res)).error.message).toContain("sub-Z cannot access")
+    } finally {
+      setSystemTime()
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
+  })
+
+  test("invalidates a scoped catalog when credentials are replaced", async () => {
+    let sub = makeSub("S")
+    proxy.setSubSource(() => [sub])
+    const headers = { "x-subby-subscription": sub.label }
+
+    try {
+      const first = await fetch(`${base}/v1/models`, { headers })
+      expect((await json(first)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-for-S-old"])
+
+      const replacement = makeSub("S")
+      replacement.tokens.access = "tok-S-new"
+      sub = replacement
+      proxy.credentialsUpdated(sub.id)
+
+      const second = await fetch(`${base}/v1/models`, { headers })
+      expect((await json(second)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-for-S-new"])
+    } finally {
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
+  })
+
+  test("re-resolves a scoped subscription when its credentials are replaced", async () => {
+    let sub = makeSub("R")
+    proxy.setSubSource(() => [sub])
+    const before = modelHits
+    const started = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    modelRequestStarted = started.resolve
+    modelRequestRelease = release.promise
+    const request = fetch(`${base}/v1/models`, { headers: { "x-subby-subscription": sub.label } })
+
+    try {
+      await started.promise
+      const replacement = makeSub("R")
+      replacement.tokens.accountId = "C"
+      sub = replacement
+      proxy.credentialsUpdated(sub.id)
+      release.resolve()
+
+      const res = await request
+      expect(res.status).toBe(200)
+      expect((await json(res)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-for-C"])
+      expect(modelHits).toBe(before + 2)
+    } finally {
+      release.resolve()
+      modelRequestStarted = null
+      modelRequestRelease = null
       proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
     }
   })
@@ -442,22 +560,35 @@ describe("subby proxy", () => {
     expect(hits).toEqual(["F", "F", "G"])
   })
 
-  test("does not requarantine an account when old credentials fail after reauthentication", async () => {
+  test("retries with replacement credentials when an old request is rejected", async () => {
     const rejected = makeSub("F")
+    const started = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    responseRequestStarted = started.resolve
+    responseRequestRelease = release.promise
     proxy.credentialsUpdated(rejected.id)
     proxy.setSubSource(() => [rejected])
+    hits.length = 0
     const oldRequest = responses({ model: "gpt-5.4", input: "reject old credentials", delayAuth: true })
-    await Bun.sleep(10)
 
-    const reauthenticated = makeSub("C")
-    reauthenticated.id = rejected.id
-    proxy.setSubSource(() => [reauthenticated])
-    proxy.credentialsUpdated(reauthenticated.id)
-    expect((await oldRequest).status).toBe(503)
+    try {
+      await started.promise
+      const reauthenticated = makeSub("C")
+      reauthenticated.id = rejected.id
+      proxy.setSubSource(() => [reauthenticated])
+      proxy.credentialsUpdated(reauthenticated.id)
+      release.resolve()
 
-    const res = await responses({ model: "gpt-5.4", input: "use new credentials" })
-    expect(res.status).toBe(200)
-    expect((await json(res)).account).toBe("C")
+      const res = await oldRequest
+      expect(res.status).toBe(200)
+      expect((await json(res)).account).toBe("C")
+      expect(hits).toEqual(["F", "C"])
+    } finally {
+      release.resolve()
+      responseRequestStarted = null
+      responseRequestRelease = null
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
   })
 
   test("fails over when the sticky sub is used up", async () => {

@@ -8,11 +8,12 @@ const upstreamBase = () => process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.co
 const responsesUrl = () => `${upstreamBase()}/codex/responses`
 const modelsUrl = () => {
   const url = new URL(`${upstreamBase()}/codex/models`)
-  url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.147.0")
+  url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.153.2")
   return url
 }
 const MODEL_CACHE_TTL_MS = 5 * 60_000
 const MODEL_REQUEST_TIMEOUT_MS = 5_000
+const MODEL_SUBSCRIPTION_HEADER = "x-subby-subscription"
 const usageTimeoutMs = () => Number(process.env.SUBBY_USAGE_TIMEOUT_MS) || 5_000
 
 // Terminal usage-limit errors (plan exhausted) vs transient 429 rate limits
@@ -37,6 +38,8 @@ class AccountAuthError extends Error {
     super(message)
   }
 }
+
+class CredentialsChangedError extends Error {}
 
 function errorResponse(status: number, message: string): Response {
   return Response.json({ error: { message, type: "subby_error", param: null, code: null } }, { status })
@@ -143,6 +146,8 @@ export function credentialsUpdated(id: string): void {
   credentialGenerations.set(id, credentialGeneration(id) + 1)
   state.exhausted.delete(id)
   pendingTokenSaves.delete(id)
+  modelCache.delete(id)
+  modelCache.delete("")
 }
 
 function saveRefreshedToken(sub: Sub, previousAccessToken: string, generation: number): void {
@@ -236,21 +241,31 @@ async function withAccessToken(sub: Sub, forceFresh: boolean, request: (accessTo
     const message = e instanceof Error ? e.message : String(e)
     throw new AccountAuthError(message, e instanceof TokenRefreshError && e.permanent)
   }
+  if (generation !== credentialGeneration(sub.id)) throw new CredentialsChangedError()
   saveRefreshedToken(sub, before, generation)
 
   const accessToken = sub.tokens.access
-  return { response: await request(accessToken), accessToken }
+  const response = await request(accessToken)
+  if (generation !== credentialGeneration(sub.id)) {
+    try {
+      await response.body?.cancel()
+    } catch {}
+    throw new CredentialsChangedError()
+  }
+  return { response, accessToken }
 }
 
 async function withAuthRetry(sub: Sub, request: (accessToken: string) => Promise<Response>, generation = credentialGeneration(sub.id)): Promise<Response> {
   const first = await withAccessToken(sub, false, request, generation)
   if (first.response.status !== 401) return first.response
   await first.response.text()
+  if (generation !== credentialGeneration(sub.id)) throw new CredentialsChangedError()
 
   const forceRefresh = sub.tokens.access === first.accessToken
   const retry = await withAccessToken(sub, forceRefresh, request, generation)
   if (retry.response.status !== 401) return retry.response
   await retry.response.text()
+  if (generation !== credentialGeneration(sub.id)) throw new CredentialsChangedError()
   throw new AccountAuthError(`${sub.label} is unauthorized`, true)
 }
 
@@ -599,6 +614,10 @@ async function handleResponses(req: Request): Promise<Response> {
     try {
       res = await forward(sub, body, req.signal, generation)
     } catch (e) {
+      if (e instanceof CredentialsChangedError) {
+        i--
+        continue
+      }
       state.lastError = e instanceof Error ? e.message : String(e)
       if (e instanceof AccountAuthError) {
         if (!e.permanent) return errorResponse(502, `token refresh failed: ${state.lastError}`)
@@ -650,7 +669,7 @@ function modelObject(id: string) {
   return { id, object: "model", created: 0, owned_by: "openai" }
 }
 
-let modelCache: { at: number; ids: string[] } | null = null
+const modelCache = new Map<string, { at: number; ids: string[] }>()
 
 async function parseModelIds(res: Response): Promise<string[]> {
   let value: unknown
@@ -668,13 +687,30 @@ async function parseModelIds(res: Response): Promise<string[]> {
   return [...new Set(slugs)]
 }
 
-async function modelIds(signal: AbortSignal): Promise<string[]> {
-  const cached = modelCache
+function selectedModelSubId(req: Request): string | null {
+  const selector = req.headers.get(MODEL_SUBSCRIPTION_HEADER)
+  if (selector === null) return null
+
+  const codexSubs = getSubs().filter((sub) => sub.provider === "codex")
+  const byId = codexSubs.find((sub) => sub.id === selector)
+  if (byId) return byId.id
+
+  const byLabel = codexSubs.filter((sub) => sub.label === selector)
+  if (byLabel.length === 1) return byLabel[0]!.id
+  if (byLabel.length > 1) throw new ApiError(409, `codex subscription '${selector}' is ambiguous; use its id`)
+  throw new ApiError(404, `codex subscription '${selector}' not found`)
+}
+
+async function modelIds(signal: AbortSignal, selectedSubId: string | null): Promise<string[]> {
+  const cacheKey = selectedSubId ?? ""
+  const cached = modelCache.get(cacheKey)
   if (cached && Date.now() - cached.at < MODEL_CACHE_TTL_MS) return cached.ids
 
   const allSubs = getSubs().filter((sub) => sub.provider === "codex")
+  const selectedSub = selectedSubId ? allSubs.find((sub) => sub.id === selectedSubId) : null
+  if (selectedSubId && !selectedSub) throw new ApiError(404, `codex subscription '${selectedSubId}' not found`)
   const current = allSubs.find((sub) => sub.id === state.currentId)
-  const subs = current ? [current, ...allSubs.filter((sub) => sub !== current)] : allSubs
+  const subs = selectedSub ? [selectedSub] : current ? [current, ...allSubs.filter((sub) => sub !== current)] : allSubs
   if (!subs.length) {
     if (cached) return cached.ids
     throw new ApiError(503, "no codex subs configured in subby")
@@ -702,6 +738,7 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
         requestSignal,
       )
     } catch (e) {
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSubId)
       if (e instanceof AccountAuthError) {
         failure = new ApiError(e.permanent ? 503 : 502, `token refresh failed: ${e.message}`)
         if (e.permanent) exhaust(sub, undefined, generation)
@@ -710,38 +747,42 @@ async function modelIds(signal: AbortSignal): Promise<string[]> {
       }
       continue
     }
+    if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSubId)
     if (res.status === 403) {
       await res.text()
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSubId)
       exhaust(sub, undefined, generation)
       failure = new ApiError(503, `${sub.label} cannot access the models catalog`)
       continue
     }
     if (!res.ok) {
       await res.text()
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSubId)
       failure = new ApiError(res.status, `models upstream returned ${res.status}`)
       break
     }
 
     try {
       const ids = await parseModelIds(res)
-      if (generation !== credentialGeneration(sub.id)) return modelIds(signal)
-      modelCache = { at: Date.now(), ids }
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSubId)
+      modelCache.set(cacheKey, { at: Date.now(), ids })
       return ids
     } catch (e) {
+      if (generation !== credentialGeneration(sub.id)) return modelIds(signal, selectedSubId)
       failure = e instanceof ApiError ? e : new ApiError(502, "models upstream returned an invalid catalog")
       break
     }
   }
-  if (cached) return cached.ids
+  if (cached && !selectedSubId) return cached.ids
   throw failure
 }
 
-async function handleModels(signal: AbortSignal): Promise<Response> {
-  return Response.json({ object: "list", data: (await modelIds(signal)).map(modelObject) })
+async function handleModels(req: Request): Promise<Response> {
+  return Response.json({ object: "list", data: (await modelIds(req.signal, selectedModelSubId(req))).map(modelObject) })
 }
 
-async function handleModel(id: string, signal: AbortSignal): Promise<Response> {
-  if (!(await modelIds(signal)).includes(id)) return errorResponse(404, `model '${id}' not found`)
+async function handleModel(req: Request, id: string): Promise<Response> {
+  if (!(await modelIds(req.signal, selectedModelSubId(req))).includes(id)) return errorResponse(404, `model '${id}' not found`)
   return Response.json(modelObject(id))
 }
 
@@ -768,11 +809,11 @@ export function startProxy(port = Number(process.env.SUBBY_PORT) || 8787): void 
           return await handleResponses(req)
         }
         if (req.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
-          return await handleModels(req.signal)
+          return await handleModels(req)
         }
         if (req.method === "GET") {
           const match = url.pathname.match(/^\/(?:v1\/)?models\/(.+)$/)
-          if (match) return await handleModel(decodeURIComponent(match[1]!), req.signal)
+          if (match) return await handleModel(req, decodeURIComponent(match[1]!))
         }
         return errorResponse(404, `subby proxy: unknown route ${req.method} ${url.pathname}`)
       } catch (e) {
