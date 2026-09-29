@@ -6,7 +6,7 @@ import type { Sub, Usage } from "./types.ts"
 
 const upstreamBase = () => process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.com/backend-api"
 const responsesUrl = () => `${upstreamBase()}/codex/responses`
-const modelsUrl = async () => {
+const modelsUrl = async (signal: AbortSignal) => {
   let output: string
   try {
     const executable = Bun.which("codex", { PATH: process.env.PATH })
@@ -15,10 +15,14 @@ const modelsUrl = async () => {
       stdin: "ignore",
       stdout: "pipe",
       stderr: "ignore",
-      timeout: MODEL_REQUEST_TIMEOUT_MS,
+      signal,
     })
-    output = (await new Response(child.stdout).text()).trim()
-    if (await child.exited !== 0) throw new Error("command failed")
+    const [stdout, exitCode] = await abortable(
+      () => Promise.all([new Response(child.stdout).text(), child.exited]),
+      signal,
+    )
+    output = stdout.trim()
+    if (exitCode !== 0) throw new Error("command failed")
   } catch {
     throw new ApiError(503, "cannot run codex --version; install Codex and ensure it is on PATH")
   }
@@ -736,8 +740,8 @@ async function modelIds(signal: AbortSignal, selectedSubId: string | null): Prom
     throw new ApiError(503, "no codex subs configured in subby")
   }
 
-  const url = await modelsUrl()
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)])
+  const url = await modelsUrl(requestSignal)
   let failure = new ApiError(502, "models request failed")
   for (const sub of subs) {
     const generation = credentialGeneration(sub.id)

@@ -340,6 +340,18 @@ describe("subby proxy", () => {
     }
   })
 
+  test("bounds version detection when a descendant keeps stdout open", async () => {
+    proxy.setSubSource(() => [makeSub("slow-codex")])
+    try {
+      writeFileSync(join(responseCacheDir, "codex"), "#!/bin/sh\n/bin/sleep 8 &\nwait\n")
+      const response = await fetch(`${base}/v1/models`, { headers: { "x-subby-subscription": "slow-codex" } })
+      expect(response.status).toBe(503)
+    } finally {
+      installCodex(installedCodexVersion)
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
+  }, 7_000)
+
   test("re-resolves a scoped subscription when its credentials are replaced", async () => {
     let sub = makeSub("R")
     proxy.setSubSource(() => [sub])
