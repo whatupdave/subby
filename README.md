@@ -27,6 +27,8 @@ The proxy implements:
 
 Model endpoints use a five-minute cache of the authenticated Codex model catalog, so newly available models do not require a subby release.
 
+Each catalog refresh runs `codex --version` using the Codex executable on `PATH` and sends its installed version to the backend. Codex upgrades are picked up on the next refresh without restarting Subby. If Codex is missing, fails to report its version, or takes longer than five seconds, model discovery returns a `503` error rather than advertising a hardcoded version.
+
 Scope either model endpoint to one Codex subscription with its exact label from the TUI or its stable subscription ID:
 
 ```bash
@@ -79,7 +81,6 @@ Routing never waits for the usage endpoint. A terminal usage-limit response imme
 | `SUBBY_HOST` | `127.0.0.1` | Proxy bind address |
 | `SUBBY_PORT` | `8787` | Proxy port |
 | `SUBBY_KEY` | unset | If set, require `Authorization: Bearer <value>` |
-| `SUBBY_CODEX_CLIENT_VERSION` | `0.153.2` | Codex compatibility version sent when fetching the model catalog |
 | `SUBBY_USAGE_TIMEOUT_MS` | `5000` | Timeout for background usage refresh after a subscription is exhausted |
 | `SUBBY_RESPONSE_CACHE_PATH` | `~/.subby/response-cache.sqlite` | Response transcript cache file |
 | `SUBBY_RESPONSE_CACHE_MAX_ENTRIES` | `10000` | Maximum cached responses |
