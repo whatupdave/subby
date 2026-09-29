@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeAll, afterAll, setSystemTime } from "bun:test"
 import { Database } from "bun:sqlite"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import * as proxy from "./src/proxy.ts"
@@ -13,12 +13,17 @@ let lastAccept: string | null = null
 let lastBody: Record<string, unknown> | null = null
 let refreshHits = 0
 let modelHits = 0
-let modelClientVersion: string | null = null
+let installedCodexVersion = "0.999.0"
 let modelRequestStarted: (() => void) | null = null
 let modelRequestRelease: Promise<void> | null = null
 let responseRequestStarted: (() => void) | null = null
 let responseRequestRelease: Promise<void> | null = null
 const responseCacheDir = mkdtempSync(join(tmpdir(), "subby-response-cache-"))
+const originalPath = process.env.PATH
+
+function installCodex(version: string): void {
+  writeFileSync(join(responseCacheDir, "codex"), `#!/bin/sh\n[ "$1" = "--version" ] || exit 1\nprintf 'codex-cli ${version}\\n'\n`, { mode: 0o700 })
+}
 
 function freshAccessToken(): string {
   const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3_600 })).toString("base64url")
@@ -38,7 +43,9 @@ const upstream = Bun.serve({
     }
     if (url.pathname === "/codex/models") {
       modelHits++
-      modelClientVersion = url.searchParams.get("client_version")
+      if (url.searchParams.get("client_version") !== installedCodexVersion) {
+        return new Response("incorrect Codex client version", { status: 400 })
+      }
       if (acct === "A") return new Response("forbidden", { status: 403 })
       if (acct === "C") return Response.json({ models: [{ slug: "gpt-for-C" }] })
       if (acct === "R") {
@@ -147,6 +154,8 @@ function makeSub(id: string): Sub {
 let base = ""
 
 beforeAll(() => {
+  installCodex(installedCodexVersion)
+  process.env.PATH = `${responseCacheDir}:${originalPath ?? ""}`
   process.env.SUBBY_CHATGPT_BASE = `http://127.0.0.1:${upstream.port}`
   process.env.SUBBY_RESPONSE_CACHE_PATH = join(responseCacheDir, "responses.sqlite")
   process.env.SUBBY_OPENAI_TOKEN_URL = `http://127.0.0.1:${upstream.port}/oauth/token`
@@ -158,6 +167,8 @@ beforeAll(() => {
 
 afterAll(() => {
   proxy.stopProxy()
+  if (originalPath === undefined) delete process.env.PATH
+  else process.env.PATH = originalPath
   closeResponseCache()
   rmSync(responseCacheDir, { recursive: true, force: true })
   proxy.setSubSaver(null)
@@ -190,7 +201,6 @@ describe("subby proxy", () => {
     expect(res.status).toBe(200)
     expect(j.object).toBe("list")
     expect(j.data.map((m: any) => m.id)).toEqual(["gpt-5.6-sol", "gpt-dynamic"])
-    expect(modelClientVersion).toBe("0.153.2")
   })
 
   test("/v1/models/:model retrieves a model from the cached catalog", async () => {
@@ -285,6 +295,47 @@ describe("subby proxy", () => {
       const second = await fetch(`${base}/v1/models`, { headers })
       expect((await json(second)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-for-S-new"])
     } finally {
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
+  })
+
+  test("picks up a Codex upgrade when the model catalog expires", async () => {
+    proxy.setSubSource(() => [makeSub("V")])
+    const headers = { "x-subby-subscription": "V" }
+    try {
+      const first = await fetch(`${base}/v1/models`, { headers })
+      expect(first.status).toBe(200)
+      installedCodexVersion = "0.1000.0-alpha.1"
+      installCodex(installedCodexVersion)
+      setSystemTime(Date.now() + 5 * 60_000 + 1)
+      const refreshed = await fetch(`${base}/v1/models`, { headers })
+      expect(refreshed.status).toBe(200)
+      expect((await json(refreshed)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-5.6-sol", "gpt-dynamic"])
+    } finally {
+      setSystemTime()
+      installedCodexVersion = "0.999.0"
+      installCodex(installedCodexVersion)
+      proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
+    }
+  })
+
+  test("reports a missing Codex executable and recovers after installation", async () => {
+    proxy.setSubSource(() => [makeSub("missing-codex")])
+    const headers = { "x-subby-subscription": "missing-codex" }
+    const path = process.env.PATH
+    try {
+      rmSync(join(responseCacheDir, "codex"))
+      process.env.PATH = responseCacheDir
+      const missing = await fetch(`${base}/v1/models`, { headers })
+      expect(missing.status).toBe(503)
+      expect((await json(missing)).error.message).toContain("codex --version")
+      installCodex(installedCodexVersion)
+      const recovered = await fetch(`${base}/v1/models`, { headers })
+      expect(recovered.status).toBe(200)
+      expect((await json(recovered)).data.map((model: { id: string }) => model.id)).toEqual(["gpt-5.6-sol", "gpt-dynamic"])
+    } finally {
+      process.env.PATH = path
+      installCodex(installedCodexVersion)
       proxy.setSubSource(() => [makeSub("A"), makeSub("B"), makeSub("C")])
     }
   })

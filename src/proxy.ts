@@ -6,9 +6,29 @@ import type { Sub, Usage } from "./types.ts"
 
 const upstreamBase = () => process.env.SUBBY_CHATGPT_BASE ?? "https://chatgpt.com/backend-api"
 const responsesUrl = () => `${upstreamBase()}/codex/responses`
-const modelsUrl = () => {
+const modelsUrl = async () => {
+  let output: string
+  try {
+    const executable = Bun.which("codex", { PATH: process.env.PATH })
+    if (!executable) throw new Error("codex not found on PATH")
+    const child = Bun.spawn([executable, "--version"], {
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: MODEL_REQUEST_TIMEOUT_MS,
+    })
+    output = (await new Response(child.stdout).text()).trim()
+    if (await child.exited !== 0) throw new Error("command failed")
+  } catch {
+    throw new ApiError(503, "cannot run codex --version; install Codex and ensure it is on PATH")
+  }
+  const prefix = "codex-cli "
+  const version = output.slice(prefix.length).trim()
+  if (!output.startsWith(prefix) || !version) {
+    throw new ApiError(503, "cannot read the installed version from codex --version")
+  }
   const url = new URL(`${upstreamBase()}/codex/models`)
-  url.searchParams.set("client_version", process.env.SUBBY_CODEX_CLIENT_VERSION ?? "0.153.2")
+  url.searchParams.set("client_version", version)
   return url
 }
 const MODEL_CACHE_TTL_MS = 5 * 60_000
@@ -716,6 +736,7 @@ async function modelIds(signal: AbortSignal, selectedSubId: string | null): Prom
     throw new ApiError(503, "no codex subs configured in subby")
   }
 
+  const url = await modelsUrl()
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(MODEL_REQUEST_TIMEOUT_MS)])
   let failure = new ApiError(502, "models request failed")
   for (const sub of subs) {
@@ -724,7 +745,7 @@ async function modelIds(signal: AbortSignal, selectedSubId: string | null): Prom
     try {
       res = await abortable(
         () => withAuthRetry(sub, (accessToken) =>
-          fetch(modelsUrl(), {
+          fetch(url, {
             headers: {
               authorization: `Bearer ${accessToken}`,
               "chatgpt-account-id": sub.tokens.accountId ?? "",
